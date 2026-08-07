@@ -268,9 +268,25 @@ def _template_cache() -> dict:
     return {"version": 0, "data": None}
 
 
+def active_tenant() -> str:
+    """
+    Which clinic's templates to show.
+
+    Read through a getattr rather than directly, because a host that reloads the
+    script without re-importing its modules leaves a stale `storage` in memory -
+    Streamlit Cloud does exactly this on a redeploy. A doctor mid-clinic should
+    see a banner asking for a reboot, not a crash screen.
+    """
+    resolver = getattr(storage, "current_tenant", None)
+    if resolver is None:
+        st.session_state["stale_modules"] = True
+        return getattr(storage, "DEFAULT_TENANT", "default")
+    return resolver()
+
+
 def load_templates() -> dict:
     cache = _template_cache()
-    tenant = storage.current_tenant()
+    tenant = active_tenant()
     # Keyed by tenant so one clinic's cache can never be served to another.
     if cache["data"] is None or cache.get("tenant") != tenant:
         cache["tenant"] = tenant
@@ -465,6 +481,13 @@ with del_col:
         _dialog_delete(template)
 
 access.sign_out_control()
+
+if st.session_state.get("stale_modules"):
+    st.sidebar.warning(
+        "This app was updated but is still running the previous code. Open "
+        "**Manage app** (bottom right) and press **Reboot** to finish the update.",
+        icon=":material/restart_alt:",
+    )
 
 problem = storage.storage_problem()
 if problem:
