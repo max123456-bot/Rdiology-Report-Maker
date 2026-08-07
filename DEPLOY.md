@@ -146,6 +146,50 @@ tool becomes somebody's data breach.
 
 ---
 
+## Hosting it on Render
+
+`render.yaml` is in the repo. Render reads it, builds the app, creates the database and
+wires them together, so no connection string is ever copied by hand.
+
+1. **[render.com](https://render.com)** → sign in with GitHub → **New** → **Blueprint**.
+2. Pick `Rdiology-Report-Maker`. Render finds `render.yaml` and shows what it will create:
+   one web service and one Postgres database, both free, Singapore region (closest to India).
+3. It asks for the two secrets that are deliberately not in the file:
+   - `GEMINI_API_KEY` — your key
+   - `ACCESS_CODE` — **required.** This is a public URL holding patient reports.
+4. Apply. First build takes a few minutes.
+5. Move your existing templates across, from this PC:
+   ```
+   python migrate_storage.py --to "<the External Database URL from Render>" --dry-run
+   ```
+   Check the list, then run it again without `--dry-run`.
+
+### Free tier: two things that will catch you out
+
+**The database may be deleted.** Render's free Postgres has historically been removed
+after a fixed period (30 days at the time of writing). If that is still their policy,
+**every doctor template and everything the app has learned goes with it.** Check the
+current terms on the database page before you rely on it. Either upgrade that one
+component, or set a calendar reminder to run:
+
+```
+python migrate_storage.py --from "<render url>" --to files
+```
+
+That pulls everything back to this PC as JSON, and you can push it to a fresh database.
+Do it monthly regardless — it is your backup.
+
+**The app sleeps.** A free Render web service spins down after about 15 minutes of no
+traffic, and the next visit waits roughly a minute for it to wake. Fine for you; it
+looks broken to a doctor mid-clinic. The paid tier keeps it warm.
+
+### If the database is unreachable
+
+The app does not hang or crash: it falls back to JSON files within 8 seconds and shows a
+red banner in the sidebar explaining why. Work continues — but anything saved during that
+window lands on the server's temporary disk and will not survive a restart, so fix the
+database before carrying on.
+
 ## Deploying to Streamlit Cloud instead
 
 Possible, but understand the trade: it is a public URL, and the filesystem is wiped on

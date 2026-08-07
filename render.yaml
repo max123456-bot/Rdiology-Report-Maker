@@ -1,0 +1,53 @@
+# Render deployment.
+#
+# Point Render at this repository and it reads this file: it builds the app,
+# creates the database, and wires STORAGE_URL between them so you never copy a
+# connection string by hand.
+#
+# Two secrets are NOT in here on purpose - they are set once in the Render
+# dashboard so they never reach the repository:
+#
+#     GEMINI_API_KEY   your key from aistudio.google.com
+#     ACCESS_CODE      required: this is a public URL holding patient reports
+#
+# Read the free-tier warnings in DEPLOY.md before relying on this.
+
+services:
+  - type: web
+    name: radiology-report-maker
+    runtime: python
+    plan: free
+    region: singapore          # closest Render region to India
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    # $PORT is assigned by Render; 0.0.0.0 so it accepts the proxied traffic.
+    startCommand: >
+      streamlit run app.py
+      --server.port $PORT
+      --server.address 0.0.0.0
+      --server.headless true
+      --server.enableCORS false
+      --server.enableXsrfProtection true
+      --browser.gatherUsageStats false
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      # Wired automatically from the database below - no copy-paste, and it
+      # updates itself if Render ever moves the database.
+      - key: STORAGE_URL
+        fromDatabase:
+          name: radiology-reports-db
+          property: connectionString
+      # sync: false means "ask me in the dashboard, never store it in git".
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: ACCESS_CODE
+        sync: false
+
+databases:
+  - name: radiology-reports-db
+    plan: free
+    region: singapore
+    databaseName: reports
+    user: reports

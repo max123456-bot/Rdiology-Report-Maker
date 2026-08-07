@@ -31,6 +31,10 @@ from datetime import datetime, timezone
 from typing import Protocol
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# A database that does not answer must never hold up a clinic. Fail in seconds
+# and fall back to files, rather than hanging the app.
+CONNECT_TIMEOUT = 8
+
 
 
 class ConflictError(RuntimeError):
@@ -245,7 +249,12 @@ class SqlStore:
                 raise RuntimeError(
                     "Postgres storage needs the driver:  pip install 'psycopg[binary]'"
                 ) from exc
-            self._conn = psycopg.connect(self.url, autocommit=True)
+            # Without an explicit timeout an unreachable host blocks forever and
+            # takes the whole app with it - which is exactly what happens when a
+            # free-tier database is paused, moved, or the URL is stale.
+            self._conn = psycopg.connect(
+                self.url, autocommit=True, connect_timeout=CONNECT_TIMEOUT
+            )
             self._ph = "%s"
         else:
             import sqlite3
