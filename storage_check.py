@@ -56,6 +56,9 @@ def suite(store: storage.Store, label: str) -> None:
           "the refused write left the record untouched")
 
     # -- concurrent writers: exactly one must win --------------------------- #
+    # n=0 is the baseline. Writers use 1..5 so none of them writes content
+    # identical to it - an idempotent re-write changes no bytes and therefore
+    # correctly raises no conflict, which would muddy what this is testing.
     store.save("Race", {"name": "Race", "n": 0})
     base = store.fingerprint("Race")
     results: list[str] = []
@@ -73,7 +76,7 @@ def suite(store: storage.Store, label: str) -> None:
             with lock:
                 results.append(f"error:{exc}")
 
-    threads = [threading.Thread(target=writer, args=(i,)) for i in range(5)]
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(1, 6)]
     for t in threads:
         t.start()
     for t in threads:

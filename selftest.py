@@ -419,6 +419,92 @@ def check_speech_backends() -> None:
           "speech: the layout pass lost its safety rules")
 
 
+def check_validation() -> None:
+    """The clinical checks must catch real errors and stay quiet on a clean report."""
+    import validate
+
+    clean_text = open(os.path.join(HERE, "samples", "sample_usg_abdomen.txt"),
+                      encoding="utf-8").read()
+    clean = validate.validate(parse_report(clean_text, ParseOptions()).blocks)
+    check(clean.ok, f"validation: a clean report should be silent -> {validate.summary(clean)}")
+
+    def issues(text):
+        return validate.validate(parse_report(text, ParseOptions()).blocks)
+
+    # The one that matters most: a measurement invented in the impression.
+    slipped = issues(clean_text.replace(
+        "cholelithiasis measuring 4 mm to 11 mm",
+        "cholelithiasis measuring 41 mm to 11 mm", 1))
+    check(any("41 mm" in f.title for f in slipped.critical),
+          "validation: a measurement only in the impression must be critical")
+
+    side = issues(
+        "USG KIDNEYS\n\nPATIENT NAME: X\nAGE/SEX: 40 Y / M\n\n"
+        "FINDINGS:\nThe right kidney shows a calculus measuring 6 mm.\n\n"
+        "IMPRESSION:\nLeft renal calculus measuring 6 mm.\n"
+    )
+    check(any("left" in f.title.lower() and "right" in f.title.lower()
+              for f in side.critical),
+          "validation: laterality disagreement must be critical")
+
+    leftover = issues(
+        "CT BRAIN\n\nPATIENT NAME: XXX\nAGE/SEX: 50 Y / M\n\n"
+        "FINDINGS:\nA [[hypodense]] lesion measuring 8 mm.\n\n"
+        "IMPRESSION:\nLesion measuring 8 mm. TBD\n"
+    )
+    check(any("Unconfirmed" in f.title for f in leftover.critical),
+          "validation: [[uncertain]] markers must be critical")
+    check(any("Placeholder" in f.title for f in leftover.critical),
+          "validation: placeholder text must be critical")
+
+    empty = issues(
+        "USG\n\nPATIENT NAME: Y\nAGE/SEX: 33 Y / F\n\n"
+        "FINDINGS:\nLiver is normal.\n\nIMPRESSION:\n"
+    )
+    check(any("IMPRESSION is empty" in f.title for f in empty.critical),
+          "validation: an empty impression must be critical")
+
+    check(not clean.critical, "validation: no false criticals on a clean report")
+
+
+def check_dictation_cleanup() -> None:
+    """Spoken numbers, units, and near-miss suggestions."""
+    import dictation_fix as D
+
+    cases = {
+        "liver measures fourteen point two centimetres": "14.2 cm",
+        "calculi measuring four millimetres to eleven millimetres": "4 mm to 11 mm",
+        "right kidney nine point eight by four point four centimetres": "9.8 x 4.4 cm",
+        "ejection fraction fifty five percent": "55%",
+        "lesion 4mm across": "4 mm",
+        "one hundred and twenty HU": "120 HU",
+    }
+    for spoken, expected in cases.items():
+        out, _ = D.spoken_numbers(spoken)
+        out, _ = D.units(out)
+        check(expected in out, f"dictation: {spoken!r} -> expected {expected!r}, got {out!r}")
+
+    # Ordinary prose must survive untouched - this is where a clumsy rule does harm.
+    for prose in ["No focal lesion is seen.",
+                  "The patient has one previous study for comparison.",
+                  "Point tenderness in the right upper quadrant.",
+                  "Grade I changes.",
+                  "The mass is in the left lobe."]:
+        out, _ = D.spoken_numbers(prose)
+        out, _ = D.units(out)
+        check(out == prose, f"dictation: prose was altered -> {prose!r} became {out!r}")
+
+    vocab = ["cholelithiasis", "hydronephrosis", "craniocaudal", "echotexture"]
+    hits = D.near_misses("hydro nephrosis absent, cranio caudal span normal", vocab)
+    found = {h.suggested for h in hits}
+    check("hydronephrosis" in found, "dictation: split word not matched to vocabulary")
+    check("craniocaudal" in found, "dictation: split word not matched to vocabulary")
+
+    # A correct term must never be "suggested" against itself.
+    check(not D.near_misses("cholelithiasis is present", vocab),
+          "dictation: a correct term was flagged as a near miss")
+
+
 def main() -> int:
     paths = sorted(glob.glob(os.path.join(HERE, "samples", "*.txt")))
     if not paths:
@@ -456,7 +542,10 @@ def main() -> int:
     check_learning()
     check_dictation()
     check_speech_backends()
-    print("as-is, rich text, templates, drafting, learning, dictation and AI4Bharat: checked")
+    check_validation()
+    check_dictation_cleanup()
+    print("as-is, rich text, templates, drafting, learning, dictation, AI4Bharat,\n"
+          "      clinical validation and dictation cleanup: checked")
 
     print()
     if failures:

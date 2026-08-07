@@ -22,9 +22,11 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import access
+import dictation_fix
 import readers
 import storage
 import templates
+import validate
 from hc_format import Block, ParseOptions, Span, build_docx, parse_report
 from verify import audit
 
@@ -951,7 +953,30 @@ with tab_single:
                     )
 
         with audit_col:
-            st.subheader("Word-loss audit")
+            st.subheader("Checks")
+
+            clinical = validate.validate(blocks)
+            if clinical.ok:
+                st.success("Report checks: nothing to flag.", icon=":material/check_circle:")
+            else:
+                critical = clinical.critical
+                if critical:
+                    st.error(
+                        f"**{len(critical)} thing(s) to fix before sending.**",
+                        icon=":material/error:",
+                    )
+                for f in clinical.sorted():
+                    icon = {"critical": ":material/error:",
+                            "warning": ":material/warning:",
+                            "note": ":material/info:"}[f.severity]
+                    with st.container(border=True):
+                        st.markdown(f"{icon} **{f.title}**")
+                        if f.detail:
+                            st.caption(f.detail)
+                        if f.where:
+                            st.caption(f"in {f.where}")
+
+            st.divider()
             render_audit(audit_result, user_edited=user_edited)
 
         if not template.builtin:
@@ -1253,6 +1278,19 @@ with tab_dictate:
                                          "applied, and nothing was checked for uncertainty.",
                             }
 
+                    # Deterministic cleanup after the model: spoken numbers to
+                    # figures, units normalised. Costs nothing and cannot invent.
+                    cleaned = dictation_fix.clean(result["transcript"], template.vocabulary)
+                    result["transcript"] = cleaned.text
+                    st.session_state["dict_cleanup"] = {
+                        "note": cleaned.note,
+                        "suggestions": [
+                            {"heard": x.heard, "suggested": x.suggested,
+                             "confidence": x.confidence}
+                            for x in (cleaned.suggestions or [])
+                        ],
+                    }
+
                     st.session_state["dict_result"] = result
                     st.session_state["dict_text"] = result["transcript"]
                     st.session_state["dict_original"] = result["transcript"]
@@ -1372,6 +1410,16 @@ with tab_dictate:
             # ---------- the transcript ---------- #
 
             st.divider()
+            cleanup = st.session_state.get("dict_cleanup") or {}
+            if cleanup.get("note"):
+                st.caption(f"Tidied automatically: {cleanup['note']}.")
+            for hit in cleanup.get("suggestions", [])[:6]:
+                st.info(
+                    f"Heard **{hit['heard']}** — did you mean **{hit['suggested']}**? "
+                    f"({int(hit['confidence'] * 100)}% similar to a term you use)",
+                    icon=":material/spellcheck:",
+                )
+
             st.subheader("Transcript — correct anything that is wrong")
             transcript = st.text_area(
                 "Transcript",

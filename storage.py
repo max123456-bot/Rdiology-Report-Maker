@@ -155,11 +155,25 @@ class FileStore:
         return out
 
     def fingerprint(self, name: str) -> str:
+        """
+        A hash of the file's contents.
+
+        Not mtime and size: Windows file timestamps are coarse enough that twenty
+        rapid writes can share one mtime, and two saves of similar-length JSON
+        share a size. Together that made two concurrent edits look identical, so
+        a stale write was accepted and silently clobbered the newer one. Hashing
+        the bytes is exact and costs well under a millisecond for a template.
+        """
+        import hashlib
+
         path = self._find(name)
         if not path or not os.path.exists(path):
             return ""
-        stat = os.stat(path)
-        return f"{stat.st_mtime_ns}:{stat.st_size}"
+        try:
+            with open(path, "rb") as fh:
+                return hashlib.sha1(fh.read()).hexdigest()
+        except OSError:
+            return ""
 
     def save(self, name: str, payload: dict, expect: str | None = None) -> None:
         with self._lock:
