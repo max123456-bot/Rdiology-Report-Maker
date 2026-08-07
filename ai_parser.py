@@ -273,30 +273,6 @@ def distill_preferences(
     return [str(r).strip() for r in (data.get("rules") or []) if str(r).strip()]
 
 
-def draft_in_house_style(
-    raw_notes: str,
-    template,
-    api_key: str,
-    model: str,
-    *,
-    section: str = "the whole report",
-    temperature: float = 0.2,
-) -> str:
-    """Rewrite rough notes into the doctor's signature style. Raises on failure."""
-    from google.genai import types
-
-    client = _client(api_key)
-    response = client.models.generate_content(
-        model=model,
-        contents=[build_draft_prompt(template, raw_notes, section)],
-        config=types.GenerateContentConfig(
-            system_instruction=DRAFT_PROMPT,
-            temperature=temperature,
-        ),
-    )
-    return (response.text or "").strip()
-
-
 def missing_facts(raw_notes: str, drafted: str) -> list[str]:
     """
     Numbers and measurements present in the notes but absent from the draft.

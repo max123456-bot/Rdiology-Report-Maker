@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import types
 import zipfile
 from dataclasses import asdict
 from datetime import datetime
@@ -103,19 +104,6 @@ def configured_secret(name: str, default: str = "") -> str:
 
 MODEL_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".model_cache.json")
 MODEL_CACHE_DAYS = 7
-
-
-def _age_phrase(iso: str) -> str:
-    try:
-        then = datetime.fromisoformat(iso)
-    except Exception:
-        return "earlier"
-    days = (datetime.now() - then).days
-    if days <= 0:
-        return "today"
-    if days == 1:
-        return "yesterday"
-    return f"{days} days ago"
 
 
 def fetch_models(key: str, force: bool = False) -> tuple[list[str], str, str]:
@@ -267,7 +255,30 @@ if use_ai:
 st.sidebar.divider()
 st.sidebar.subheader("Doctor / template")
 
-all_templates = templates.load_all()
+@st.cache_resource(show_spinner=False)
+def _template_cache() -> dict:
+    """Templates, loaded once per process rather than once per interaction.
+
+    Streamlit reruns this whole script on every click, and load_all() is a
+    network round trip to the database - about 70 ms each time, for data that
+    changes a few times a week. Cached and explicitly invalidated on write.
+    """
+    return {"version": 0, "data": None}
+
+
+def load_templates() -> dict:
+    cache = _template_cache()
+    if cache["data"] is None:
+        cache["data"] = templates.load_all()
+    return cache["data"]
+
+
+def templates_changed() -> None:
+    """Call after any save, rename or delete."""
+    _template_cache()["data"] = None
+
+
+all_templates = load_templates()
 template_names = list(all_templates.keys())
 if st.session_state.get("tpl_pick") not in template_names:
     st.session_state["tpl_pick"] = template_names[0]
@@ -309,6 +320,7 @@ def _dialog_new():
             st.error(f"“{name.strip()}” already exists — pick another name.")
         else:
             templates.save(templates.copy_of(all_templates[base_name], name.strip(), doctor.strip()))
+            templates_changed()
             st.session_state["tpl_pick"] = name.strip()
             st.rerun()
 
@@ -369,6 +381,7 @@ def _dialog_edit(current: templates.Template):
         # would take the doctor's whole learned history with it.
         try:
             templates.rename(current.name, updated)
+            templates_changed()
         except templates.ConflictError as exc:
             st.error(str(exc))
         else:
@@ -410,6 +423,7 @@ def _dialog_seed_template(report_text: str, corrections: tuple[str, str] | None 
             if corrections and corrections[0].strip() != corrections[1].strip():
                 fresh = templates.remember_correction(fresh, corrections[0], corrections[1])
             templates.save(fresh)
+            templates_changed()
             st.session_state["tpl_pick"] = fresh.name
             st.rerun()
 
@@ -427,6 +441,7 @@ def _dialog_delete(current: templates.Template):
     with yes:
         if st.button("Delete", type="primary", use_container_width=True):
             templates.delete(current.name)
+            templates_changed()
             st.session_state["tpl_pick"] = templates.HC_FORMAT.name
             st.rerun()
     with no:
@@ -547,6 +562,67 @@ def make_blocks(raw_text: str) -> tuple[list[Block], list[str], str]:
         "AI output failed the word-loss audit "
         f"({check.summary}) - fell back to the rule-based parser."
     ], "rule-based (AI rejected)"
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def render_report(payload: str) -> tuple[bytes, dict]:
+    """
+    Build the .docx and audit it, cached on the exact inputs.
+
+    Both cost real time - about 40 ms to render and 9 ms to read back and audit -
+    and Streamlit reruns the script on every click. Keyed on the blocks, template
+    and letterhead, so it recomputes only when the document genuinely changes.
+    """
+    import json as _json
+
+    data = _json.loads(payload)
+    blocks = [
+        Block(
+            kind=b["kind"], text=b["text"], trailer=b.get("trailer", ""),
+            spans=[Span(**sp) for sp in b.get("spans", [])],
+            trailer_spans=[Span(**sp) for sp in b.get("trailer_spans", [])],
+        )
+        for b in data["blocks"]
+    ]
+    tpl = templates.from_dict(data["template"]) if data["template"] else None
+    docx = build_docx(
+        blocks, template=tpl, letterhead=data["letterhead"] or None,
+        page_numbers=data["page_numbers"],
+    )
+    report = audit(
+        data["raw"], docx,
+        letterhead_text=data["letterhead_text"],
+        page_numbers=data["page_numbers"],
+        preserve_as_is=data["as_is"],
+    )
+    return docx, {
+        "ok": report.ok, "summary": report.summary,
+        "missing": report.missing, "added": report.added,
+        "numbers_ok": report.numbers_ok, "missing_numbers": report.missing_numbers,
+        "source_tokens": report.source_tokens,
+    }
+
+
+def render_key(blocks: list[Block], raw: str, tpl, letterhead: dict,
+               page_numbers: bool, as_is: bool, letterhead_text: str) -> str:
+    """Everything that can change the output, as one cache key."""
+    import json as _json
+    from dataclasses import asdict as _asdict
+
+    return _json.dumps({
+        "blocks": [
+            {"kind": b.kind, "text": b.text, "trailer": b.trailer,
+             "spans": [_asdict(s) for s in b.spans],
+             "trailer_spans": [_asdict(s) for s in b.trailer_spans]}
+            for b in blocks
+        ],
+        "template": templates.to_dict(tpl) if tpl else None,
+        "letterhead": {k: v for k, v in (letterhead or {}).items() if k != "logo_bytes"},
+        "page_numbers": page_numbers,
+        "as_is": as_is,
+        "raw": raw,
+        "letterhead_text": letterhead_text,
+    }, sort_keys=True, default=str)
 
 
 def safe_filename(title: str) -> str:
@@ -673,9 +749,10 @@ def structure_editor(blocks: list[Block], signature: str) -> list[Block]:
     return out or blocks
 
 
-def render_audit(raw_text: str, docx_bytes: bytes, *, user_edited: bool = False) -> None:
-    result = audit(raw_text, docx_bytes, letterhead_text=letterhead_text, page_numbers=page_numbers,
-                    preserve_as_is=opts.preserve_as_is)
+def render_audit(result, *, user_edited: bool = False) -> None:
+    """Show an audit result. The audit itself runs inside the cached render."""
+    if isinstance(result, dict):
+        result = types.SimpleNamespace(**result)
     if result.ok:
         st.success(result.summary)
         return
@@ -829,7 +906,10 @@ with tab_single:
         blocks = structure_editor(auto_blocks, signature)
 
         user_edited = blocks_to_rows(blocks) != blocks_to_rows(auto_blocks)
-        docx_bytes = build_docx(blocks, template=template, letterhead=letterhead, page_numbers=page_numbers)
+        docx_bytes, audit_result = render_report(
+            render_key(blocks, raw_text, template, letterhead, page_numbers,
+                       opts.preserve_as_is, letterhead_text)
+        )
         title = next((b.text for b in blocks if b.kind == "title"), "Radiology Report")
 
         st.divider()
@@ -872,7 +952,7 @@ with tab_single:
 
         with audit_col:
             st.subheader("Word-loss audit")
-            render_audit(raw_text, docx_bytes, user_edited=user_edited)
+            render_audit(audit_result, user_edited=user_edited)
 
         if not template.builtin:
             if st.button(
@@ -883,6 +963,7 @@ with tab_single:
                 learned = templates.copy_of(template, template.name)
                 learned.examples = list(template.examples) + [raw_text]
                 templates.save(learned)
+                templates_changed()
                 st.success(
                     f"Saved. {template.doctor or template.name} now has "
                     f"{len(learned.examples)} style example(s)."
@@ -1355,6 +1436,8 @@ with tab_dictate:
                         learned = templates.remember_vocabulary(learned, terms)
 
                     templates.save(learned)
+
+                    templates_changed()
                     st.session_state["dict_fixes"] = []
                     st.session_state["dict_original"] = transcript
                     st.success(
@@ -1532,6 +1615,7 @@ with tab_draft:
                     for question, answer in answers.items():
                         learned = templates.remember_answer(learned, question, answer)
                     templates.save(learned)
+                    templates_changed()
                     st.success(f"Saved {len(answers)} answer(s) to {doctor_label}.")
                     st.rerun()
 
@@ -1612,6 +1696,7 @@ with tab_draft:
                         template, original, drafted, note=note, rules=rules
                     )
                     templates.save(learned)
+                    templates_changed()
                     st.session_state["draft_original"] = drafted  # this edit is now taught
                     if rules:
                         st.success("Learned:")
@@ -1644,6 +1729,7 @@ with tab_draft:
                     if corrected:
                         learned = templates.remember_correction(learned, original, drafted)
                     templates.save(learned)
+                    templates_changed()
                     st.success(
                         f"Saved. {doctor_label} now knows "
                         f"{templates.learning_summary(learned)}."
@@ -1919,6 +2005,7 @@ with tab_templates:
                           if editing.builtin else "Write these changes to disk."):
             try:
                 templates.save(pending, expect=st.session_state.get(f"fp::{editing.name}"))
+                templates_changed()
             except templates.ConflictError as exc:
                 st.error(str(exc))
             else:
@@ -1933,6 +2020,7 @@ with tab_templates:
                 st.error(f"“{new_name}” already exists — change the name first.")
             else:
                 templates.save(templates.copy_of(pending, new_name))
+                templates_changed()
                 st.success(f"Created “{new_name}”. Pick it as the report format.")
                 st.rerun()
     with act3:

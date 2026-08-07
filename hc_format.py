@@ -39,7 +39,6 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
 FONT_NAME = "Arial"
-FONT_SIZE = Pt(12)
 BLACK = RGBColor(0, 0, 0)
 # Rule 2: professional spacing throughout the document.
 LINE_SPACING = 1.5
@@ -644,63 +643,3 @@ def _add_page_numbers(doc: Document, tpl) -> None:
             fld._element.append(begin)
             fld._element.append(text)
             fld._element.append(end)
-
-
-# --------------------------------------------------------------------------- #
-# HTML preview (same rules, rendered for the browser)
-# --------------------------------------------------------------------------- #
-
-
-def blocks_to_html(blocks: Iterable[Block]) -> str:
-    import html as _html
-
-    out: list[str] = [
-        '<div style="font-family:Arial,sans-serif;font-size:12pt;color:#000;'
-        f'line-height:{LINE_SPACING};'
-        'background:#fff;padding:28px 34px;border:1px solid #d0d0d0;border-radius:4px;">'
-    ]
-    open_list = False
-
-    def close_list() -> None:
-        nonlocal open_list
-        if open_list:
-            out.append("</ul>")
-            open_list = False
-
-    for block in blocks:
-        esc = _html.escape(block.text)
-        if block.kind in ("bullet", "bold_bullet"):
-            if not open_list:
-                out.append('<ul style="margin:2px 0 6px 22px;padding-left:12px;">')
-                open_list = True
-            weight = "font-weight:700;" if block.kind == "bold_bullet" else ""
-            out.append(f'<li style="margin-bottom:4px;{weight}">{esc}</li>')
-            continue
-
-        close_list()
-        if block.kind == "title":
-            out.append(
-                f'<p style="text-align:center;font-weight:700;text-decoration:underline;'
-                f'margin:0 0 14px;">{esc}</p>'
-            )
-        elif block.kind == "heading":
-            out.append(
-                f'<p style="font-weight:700;text-decoration:underline;margin:14px 0 4px;">{esc}</p>'
-            )
-        elif block.kind == "heading_inline":
-            out.append(
-                f'<p style="margin:4px 0 2px;"><span style="font-weight:700;'
-                f'text-decoration:underline;">{esc}</span> '
-                f"{_html.escape(block.trailer)}</p>"
-            )
-        elif block.kind == "subheading":
-            out.append(
-                f'<p style="font-style:italic;text-decoration:underline;font-weight:400;'
-                f'margin:8px 0 2px;">{esc}</p>'
-            )
-        else:
-            out.append(f'<p style="margin:0 0 4px;">{esc}</p>')
-
-    close_list()
-    out.append("</div>")
-    return "".join(out)
