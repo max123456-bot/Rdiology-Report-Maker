@@ -164,24 +164,49 @@ wires them together, so no connection string is ever copied by hand.
    ```
    Check the list, then run it again without `--dry-run`.
 
-### Free tier: two things that will catch you out
+### Where the database lives — and why not Render's
 
-**The database may be deleted.** Render's free Postgres has historically been removed
-after a fixed period (30 days at the time of writing). If that is still their policy,
-**every doctor template and everything the app has learned goes with it.** Check the
-current terms on the database page before you rely on it. Either upgrade that one
-component, or set a calendar reminder to run:
+`render.yaml` deliberately does **not** create a Render database. Their free Postgres has
+historically been deleted after a fixed period, and for this app that means every doctor
+template and everything it has learned goes with it.
 
+So: **Render runs the app, someone else holds the data.** Nothing in the app changes —
+`storage.py` takes any `postgres://` URL — it is purely which URL you paste.
+
+| Provider | Free tier | Catch |
+|---|---|---|
+| **Neon** — recommended | 0.5 GB, **no expiry** | Sleeps when idle, wakes in about a second |
+| Supabase | 500 MB | Pauses after a week idle; you restore it, nothing is lost |
+| Render's own | 1 GB | **Deleted after ~30 days.** Only if you upgrade it |
+
+0.5 GB is enormous here. This stores text templates, not images — a busy clinic would take
+years to fill it.
+
+**Set up Neon first:** [neon.com](https://neon.com) → sign up → create a project → copy the
+connection string. Then paste it as `STORAGE_URL` when Render asks.
+
+### Back it up monthly regardless
+
+Free tiers get paused, moved, and occasionally deleted. Whoever hosts your database, keep a
+copy that does not depend on their terms of service:
+
+```bat
+set STORAGE_URL=postgresql://your-connection-string
+backup.bat
 ```
-python migrate_storage.py --from "<render url>" --to files
-```
 
-That pulls everything back to this PC as JSON, and you can push it to a fresh database.
-Do it monthly regardless — it is your backup.
+That pulls every template and everything learned back to this PC as plain JSON, into a
+dated folder under `backups\`. Verified: templates restored from a database complete with
+their learned vocabulary and corrections.
 
-**The app sleeps.** A free Render web service spins down after about 15 minutes of no
-traffic, and the next visit waits roughly a minute for it to wake. Fine for you; it
-looks broken to a doctor mid-clinic. The paid tier keeps it warm.
+Keep one copy somewhere that is not this PC. A backup on the same machine does not survive
+that machine failing.
+
+### The app sleeps on the free tier
+
+A free Render web service spins down after about 15 minutes of no traffic, and the next
+visit waits roughly a minute for it to wake. Fine for you checking something; it looks
+broken to a doctor mid-clinic. Their paid tier keeps it warm.
 
 ### If the database is unreachable
 

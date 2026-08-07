@@ -24,3 +24,6 @@ data/
 *.db-wal
 *.db-shm
 templates/_events.jsonl
+
+# Backups pulled down from hosting
+backups/

@@ -1,16 +1,23 @@
 # Render deployment.
 #
-# Point Render at this repository and it reads this file: it builds the app,
-# creates the database, and wires STORAGE_URL between them so you never copy a
-# connection string by hand.
+# Render runs the app. The DATABASE LIVES ELSEWHERE, on purpose.
 #
-# Two secrets are NOT in here on purpose - they are set once in the Render
-# dashboard so they never reach the repository:
+# Render's free Postgres has historically been deleted after 30 days, which for
+# this app means every doctor template and everything it has learned disappears.
+# Rather than build on that, the app points at a provider whose free tier is
+# permanent. Neon is the usual choice: no expiry, and 0.5 GB is enormous for what
+# this stores (text templates, not images).
 #
+# Nothing about the app changes - storage.py takes any postgres:// URL, so this
+# is purely which URL you paste.
+#
+# THREE secrets are set once in the Render dashboard and never reach this repo:
+#
+#     STORAGE_URL      your Neon connection string (postgresql://...)
 #     GEMINI_API_KEY   your key from aistudio.google.com
 #     ACCESS_CODE      required: this is a public URL holding patient reports
 #
-# Read the free-tier warnings in DEPLOY.md before relying on this.
+# See DEPLOY.md for the walkthrough and for the backup you should run regardless.
 
 services:
   - type: web
@@ -33,21 +40,28 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11"
-      # Wired automatically from the database below - no copy-paste, and it
-      # updates itself if Render ever moves the database.
-      - key: STORAGE_URL
-        fromDatabase:
-          name: radiology-reports-db
-          property: connectionString
       # sync: false means "ask me in the dashboard, never store it in git".
+      - key: STORAGE_URL
+        sync: false
       - key: GEMINI_API_KEY
         sync: false
       - key: ACCESS_CODE
         sync: false
 
-databases:
-  - name: radiology-reports-db
-    plan: free
-    region: singapore
-    databaseName: reports
-    user: reports
+# ---------------------------------------------------------------------------
+# If you would rather use Render's own database anyway - because you have
+# upgraded it past the free tier, or you accept the expiry and will run the
+# monthly backup - delete the STORAGE_URL entry above, uncomment both blocks
+# below, and Render will wire the connection string in for you.
+#
+#      - key: STORAGE_URL
+#        fromDatabase:
+#          name: radiology-reports-db
+#          property: connectionString
+#
+# databases:
+#   - name: radiology-reports-db
+#     plan: free
+#     region: singapore
+#     databaseName: reports
+#     user: reports
