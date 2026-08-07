@@ -22,6 +22,8 @@ from docx import Document
 
 import readers
 import storage
+
+TENANT = "test-clinic"
 import templates
 import verify
 from hc_format import Block, ParseOptions, Span, build_docx, parse_report
@@ -255,13 +257,13 @@ def journey_save_safety() -> None:
 
         backups = []
         if os.path.isdir(storage.get_store().backups):
-            stem = os.path.basename(storage.get_store()._path(name))[:-5]
+            stem = os.path.basename(storage.get_store()._path(storage.current_tenant(), name))[:-5]
             backups = [f for f in os.listdir(storage.get_store().backups) if f.startswith(stem + ".")]
         check(bool(backups), f"a backup was kept before overwriting ({len(backups)} on file)")
     finally:
         templates.delete(name)
         if os.path.isdir(storage.get_store().backups):
-            stem = os.path.basename(storage.get_store()._path(name))[:-5]
+            stem = os.path.basename(storage.get_store()._path(storage.current_tenant(), name))[:-5]
             for f in os.listdir(storage.get_store().backups):
                 if f.startswith(stem + "."):
                     os.remove(os.path.join(storage.get_store().backups, f))

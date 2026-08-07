@@ -221,6 +221,48 @@ class Suggestion:
     heard: str
     suggested: str
     confidence: float
+    reason: str = "spelling"     # spelling | sound
+
+
+# Spelling differences that sound identical, collapsed so a phonetic comparison
+# sees through them. Order matters: longer patterns first.
+_SOUND_RULES = [
+    (re.compile(r"ph"), "f"),
+    (re.compile(r"ch"), "k"),
+    (re.compile(r"th"), "t"),
+    (re.compile(r"sh"), "s"),
+    (re.compile(r"gh"), ""),
+    (re.compile(r"kn|gn|pn|wr"), "n"),
+    (re.compile(r"[cq]"), "k"),
+    (re.compile(r"x"), "ks"),
+    (re.compile(r"z"), "s"),
+    (re.compile(r"y"), "i"),
+    (re.compile(r"(.)\1+"), r"\1"),   # doubled letters
+]
+
+
+def sound_key(word: str) -> str:
+    """
+    A rough phonetic skeleton, for catching what edit distance misses.
+
+    A speech engine writing "hydro nephrosis" or "coleli thiasis" produces
+    something that looks unlike the real term letter by letter but sounds almost
+    identical. Collapsing the spellings that sound the same, then dropping the
+    vowels, makes those line up.
+
+    Not a full Metaphone - deliberately. This only has to be good enough to
+    shortlist a candidate the radiologist then confirms.
+    """
+    key = re.sub(r"[^a-z]", "", (word or "").lower())
+    if not key:
+        return ""
+    for pattern, replacement in _SOUND_RULES:
+        key = pattern.sub(replacement, key)
+    if not key:
+        return ""
+    # Keep the first letter, drop the rest of the vowels: consonant shape is
+    # what survives a mis-hearing.
+    return key[0] + re.sub(r"[aeiou]", "", key[1:])
 
 
 def near_misses(text: str, vocabulary: list[str], threshold: float = 0.78) -> list[Suggestion]:
@@ -242,27 +284,62 @@ def near_misses(text: str, vocabulary: list[str], threshold: float = 0.78) -> li
     if not known:
         return []
 
-    # Compare single words and adjacent pairs: "colic list" is two words for one term.
+    # Compare single words and adjacent pairs: a term split in two ("hydro
+    # nephrosis") only matches as a pair.
     tokens = re.findall(r"[A-Za-z][A-Za-z'\-]{2,}", text)
-    candidates = set(tokens) | {
-        f"{a} {b}" for a, b in zip(tokens, tokens[1:])
+    singles = {t for t in tokens if t.lower() not in known}
+    # A pair is only worth checking if NEITHER half is already a correct term -
+    # otherwise "hydronephrosis the" gets suggested against "hydronephrosis",
+    # and a suggester that cries wolf is one nobody reads.
+    pairs = {
+        f"{a} {b}"
+        for a, b in zip(tokens, tokens[1:])
+        if a.lower() not in known and b.lower() not in known
     }
+    candidates = singles | pairs
+
+    # Phonetic index of the doctor's vocabulary, built once.
+    by_sound: dict[str, str] = {}
+    for lower, original in known.items():
+        key = sound_key(lower.replace(" ", ""))
+        if key:
+            by_sound.setdefault(key, original)
 
     out: dict[str, Suggestion] = {}
     for candidate in candidates:
         lower = candidate.lower()
         if lower in known:
             continue  # already correct
+
+        # 1. Spelling: catches typos and split words.
         match = difflib.get_close_matches(lower, known.keys(), n=1, cutoff=threshold)
-        if not match:
+        if match:
+            score = difflib.SequenceMatcher(None, lower, match[0]).ratio()
+            # A near-identical word is usually just an inflection, not an error.
+            if score < 0.99:
+                best = out.get(candidate)
+                if best is None or score > best.confidence:
+                    out[candidate] = Suggestion(candidate, known[match[0]],
+                                                round(score, 2), "spelling")
+                continue
+
+        # 2. Sound: catches what edit distance cannot, where the transcriber
+        #    wrote something that looks different but sounds nearly the same.
+        candidate_key = sound_key(lower.replace(" ", ""))
+        if len(candidate_key) < 3:
             continue
-        score = difflib.SequenceMatcher(None, lower, match[0]).ratio()
-        # A near-identical word is usually just an inflection, not an error.
-        if score >= 0.99:
+        if candidate_key in by_sound:
+            suggested = by_sound[candidate_key]
+            if suggested.lower() != lower and candidate not in out:
+                out[candidate] = Suggestion(candidate, suggested, 0.9, "sound")
             continue
-        best = out.get(candidate)
-        if best is None or score > best.confidence:
-            out[candidate] = Suggestion(candidate, known[match[0]], round(score, 2))
+        # A close-but-not-identical sound key still shortlists.
+        sound_match = difflib.get_close_matches(candidate_key, by_sound.keys(), n=1, cutoff=0.8)
+        if sound_match:
+            suggested = by_sound[sound_match[0]]
+            if suggested.lower() != lower and candidate not in out:
+                score = difflib.SequenceMatcher(None, candidate_key, sound_match[0]).ratio()
+                out[candidate] = Suggestion(candidate, suggested, round(score * 0.9, 2), "sound")
 
     return sorted(out.values(), key=lambda s: -s.confidence)
 

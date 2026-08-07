@@ -52,13 +52,35 @@ class Event:
     user: str = ""
 
 
-class Store(Protocol):
-    """What the app needs from persistence. Deliberately small."""
+DEFAULT_TENANT = "default"
 
-    def load_all(self) -> dict[str, dict]: ...
-    def save(self, name: str, payload: dict, expect: str | None = None) -> None: ...
-    def delete(self, name: str) -> bool: ...
-    def fingerprint(self, name: str) -> str: ...
+
+def clean_tenant(tenant: str | None) -> str:
+    """
+    A tenant is one clinic. Everything it owns is invisible to every other one.
+
+    Normalised hard, because this string decides who can see whose patients'
+    templates: lowercase, alphanumerics and dashes only, never empty, never a
+    path fragment.
+    """
+    import re as _re
+
+    slug = _re.sub(r"[^a-z0-9]+", "-", str(tenant or "").strip().lower()).strip("-")
+    return slug[:64] or DEFAULT_TENANT
+
+
+class Store(Protocol):
+    """What the app needs from persistence. Deliberately small.
+
+    Every operation takes a tenant. There is no way to read across tenants by
+    accident, because there is no call that omits one.
+    """
+
+    def load_all(self, tenant: str) -> dict[str, dict]: ...
+    def save(self, tenant: str, name: str, payload: dict,
+             expect: str | None = None) -> None: ...
+    def delete(self, tenant: str, name: str) -> bool: ...
+    def fingerprint(self, tenant: str, name: str) -> str: ...
     def record(self, event: Event) -> None: ...
     def events(self, limit: int = 200) -> list[Event]: ...
     def describe(self) -> str: ...
@@ -71,20 +93,28 @@ class Store(Protocol):
 
 class FileStore:
     """
-    One JSON file per template, exactly as the app has always worked.
+    One JSON file per template, under a directory per tenant.
 
-    Kept as the default because it is inspectable, diffable, trivially backed up
-    by copying a folder, and needs nothing installed. Its limits are real though:
-    no transactions, and an ephemeral filesystem loses everything.
+    Kept as the default because it is inspectable, diffable and trivially backed
+    up by copying a folder. Tenants are separate directories, so one clinic
+    physically cannot read another's files - the isolation is the filesystem's,
+    not a filter this code has to remember to apply.
     """
 
     def __init__(self, directory: str | None = None) -> None:
-        self.dir = directory or os.path.join(HERE, "templates")
-        self.backups = os.path.join(self.dir, "_backups")
-        self.events_path = os.path.join(self.dir, "_events.jsonl")
+        self.root = directory or os.path.join(HERE, "templates")
+        self.events_path = os.path.join(self.root, "_events.jsonl")
         self._lock = threading.Lock()
 
     # -- helpers ---------------------------------------------------------- #
+
+    def _tenant_dir(self, tenant: str) -> str:
+        """Templates for one clinic. clean_tenant() has already made this safe."""
+        return os.path.join(self.root, clean_tenant(tenant))
+
+    @property
+    def backups(self) -> str:
+        return os.path.join(self.root, "_backups")
 
     def _slug(self, name: str) -> str:
         import hashlib
@@ -94,19 +124,20 @@ class FileStore:
         digest = hashlib.sha1(name.strip().encode("utf-8")).hexdigest()[:8]
         return f"{stem[:60]}-{digest}.json"
 
-    def _path(self, name: str) -> str:
-        return os.path.join(self.dir, self._slug(name))
+    def _path(self, tenant: str, name: str) -> str:
+        return os.path.join(self._tenant_dir(tenant), self._slug(name))
 
-    def _find(self, name: str) -> str | None:
-        exact = self._path(name)
+    def _find(self, tenant: str, name: str) -> str | None:
+        exact = self._path(tenant, name)
         if os.path.exists(exact):
             return exact
-        if not os.path.isdir(self.dir):
+        folder = self._tenant_dir(tenant)
+        if not os.path.isdir(folder):
             return None
-        for filename in os.listdir(self.dir):
+        for filename in os.listdir(folder):
             if not filename.endswith(".json"):
                 continue
-            candidate = os.path.join(self.dir, filename)
+            candidate = os.path.join(folder, filename)
             if not os.path.isfile(candidate):
                 continue
             try:
@@ -135,14 +166,15 @@ class FileStore:
 
     # -- Store ------------------------------------------------------------ #
 
-    def load_all(self) -> dict[str, dict]:
+    def load_all(self, tenant: str) -> dict[str, dict]:
         out: dict[str, dict] = {}
-        if not os.path.isdir(self.dir):
+        folder = self._tenant_dir(tenant)
+        if not os.path.isdir(folder):
             return out
-        for filename in sorted(os.listdir(self.dir)):
+        for filename in sorted(os.listdir(folder)):
             if not filename.endswith(".json") or filename.endswith(".tmp"):
                 continue
-            path = os.path.join(self.dir, filename)
+            path = os.path.join(folder, filename)
             if not os.path.isfile(path):
                 continue
             try:
@@ -154,19 +186,18 @@ class FileStore:
                 out[str(payload["name"])] = payload
         return out
 
-    def fingerprint(self, name: str) -> str:
+    def fingerprint(self, tenant: str, name: str) -> str:
         """
         A hash of the file's contents.
 
-        Not mtime and size: Windows file timestamps are coarse enough that twenty
-        rapid writes can share one mtime, and two saves of similar-length JSON
-        share a size. Together that made two concurrent edits look identical, so
-        a stale write was accepted and silently clobbered the newer one. Hashing
-        the bytes is exact and costs well under a millisecond for a template.
+        Not mtime and size: Windows timestamps are coarse enough that twenty
+        rapid writes share one mtime, and two saves of similar-length JSON share
+        a size. Together that made concurrent edits look identical, so a stale
+        write silently clobbered the newer one.
         """
         import hashlib
 
-        path = self._find(name)
+        path = self._find(tenant, name)
         if not path or not os.path.exists(path):
             return ""
         try:
@@ -175,26 +206,28 @@ class FileStore:
         except OSError:
             return ""
 
-    def save(self, name: str, payload: dict, expect: str | None = None) -> None:
+    def save(self, tenant: str, name: str, payload: dict,
+             expect: str | None = None) -> None:
         with self._lock:
             if expect is not None:
-                current = self.fingerprint(name)
+                current = self.fingerprint(tenant, name)
                 if current and current != expect:
                     raise ConflictError(
                         f"“{name}” was changed somewhere else while you had it open. "
                         "Reload it, then reapply your edit so neither change is lost."
                     )
-            os.makedirs(self.dir, exist_ok=True)
-            target = self._path(name)
+            folder = self._tenant_dir(tenant)
+            os.makedirs(folder, exist_ok=True)
+            target = self._path(tenant, name)
             self._back_up(target)
             tmp = target + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, indent=2, ensure_ascii=False)
             os.replace(tmp, target)
 
-    def delete(self, name: str) -> bool:
+    def delete(self, tenant: str, name: str) -> bool:
         with self._lock:
-            path = self._find(name)
+            path = self._find(tenant, name)
             if path and os.path.exists(path):
                 self._back_up(path)
                 os.remove(path)
@@ -203,7 +236,7 @@ class FileStore:
 
     def record(self, event: Event) -> None:
         try:
-            os.makedirs(self.dir, exist_ok=True)
+            os.makedirs(self.root, exist_ok=True)
             with open(self.events_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(event.__dict__, ensure_ascii=False) + "\n")
         except OSError:
@@ -212,12 +245,12 @@ class FileStore:
     def events(self, limit: int = 200) -> list[Event]:
         if not os.path.exists(self.events_path):
             return []
-        rows: list[Event] = []
         try:
             with open(self.events_path, encoding="utf-8") as fh:
                 lines = fh.readlines()[-limit:]
         except OSError:
             return []
+        rows: list[Event] = []
         for line in lines:
             try:
                 rows.append(Event(**json.loads(line)))
@@ -225,8 +258,16 @@ class FileStore:
                 continue
         return list(reversed(rows))
 
+    def tenants(self) -> list[str]:
+        if not os.path.isdir(self.root):
+            return []
+        return sorted(
+            d for d in os.listdir(self.root)
+            if os.path.isdir(os.path.join(self.root, d)) and not d.startswith("_")
+        )
+
     def describe(self) -> str:
-        return f"JSON files in {os.path.basename(self.dir)}/"
+        return f"JSON files in {os.path.basename(self.root)}/"
 
 
 # --------------------------------------------------------------------------- #
@@ -290,10 +331,12 @@ class SqlStore:
             cur = self._conn.cursor()
             cur.execute(
                 f"""CREATE TABLE IF NOT EXISTS templates (
-                        name      TEXT PRIMARY KEY,
+                        tenant    TEXT NOT NULL DEFAULT 'default',
+                        name      TEXT NOT NULL,
                         payload   {json_type} NOT NULL,
                         version   INTEGER NOT NULL DEFAULT 1,
-                        updated   TEXT NOT NULL
+                        updated   TEXT NOT NULL,
+                        PRIMARY KEY (tenant, name)
                     )"""
             )
             cur.execute(
@@ -328,10 +371,13 @@ class SqlStore:
 
     # -- Store ------------------------------------------------------------ #
 
-    def load_all(self) -> dict[str, dict]:
+    def load_all(self, tenant: str) -> dict[str, dict]:
         with self._lock:
             cur = self._conn.cursor()
-            cur.execute("SELECT name, payload FROM templates")
+            cur.execute(
+                f"SELECT name, payload FROM templates WHERE tenant = {self._ph}",
+                (clean_tenant(tenant),),
+            )
             out = {}
             for name, payload in cur.fetchall():
                 try:
@@ -340,25 +386,33 @@ class SqlStore:
                     continue
             return out
 
-    def fingerprint(self, name: str) -> str:
+    def fingerprint(self, tenant: str, name: str) -> str:
         with self._lock:
             cur = self._conn.cursor()
-            cur.execute(f"SELECT version FROM templates WHERE name = {self._ph}", (name,))
+            cur.execute(
+                f"SELECT version FROM templates WHERE tenant = {self._ph} AND name = {self._ph}",
+                (clean_tenant(tenant), name),
+            )
             row = cur.fetchone()
             return str(row[0]) if row else ""
 
-    def save(self, name: str, payload: dict, expect: str | None = None) -> None:
+    def save(self, tenant: str, name: str, payload: dict,
+             expect: str | None = None) -> None:
+        tenant = clean_tenant(tenant)
         with self._lock:
             cur = self._conn.cursor()
-            cur.execute(f"SELECT version FROM templates WHERE name = {self._ph}", (name,))
+            cur.execute(
+                f"SELECT version FROM templates WHERE tenant = {self._ph} AND name = {self._ph}",
+                (tenant, name),
+            )
             row = cur.fetchone()
             now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
             if row is None:
                 cur.execute(
-                    f"INSERT INTO templates (name, payload, version, updated) "
-                    f"VALUES ({self._ph}, {self._ph}, 1, {self._ph})",
-                    (name, self._dumps(payload), now),
+                    f"INSERT INTO templates (tenant, name, payload, version, updated) "
+                    f"VALUES ({self._ph}, {self._ph}, {self._ph}, 1, {self._ph})",
+                    (tenant, name, self._dumps(payload), now),
                 )
             else:
                 current = str(row[0])
@@ -367,29 +421,40 @@ class SqlStore:
                         f"“{name}” was changed somewhere else while you had it open. "
                         "Reload it, then reapply your edit so neither change is lost."
                     )
-                # Guarding on the version in the WHERE clause means two simultaneous
-                # saves cannot both succeed - the loser updates no rows.
+                # Guarding on the version in the WHERE clause means two
+                # simultaneous saves cannot both succeed - the loser updates
+                # no rows and is told, rather than silently winning.
                 cur.execute(
                     f"UPDATE templates SET payload = {self._ph}, version = version + 1, "
-                    f"updated = {self._ph} WHERE name = {self._ph} AND version = {self._ph}",
-                    (self._dumps(payload), now, name, int(current)),
+                    f"updated = {self._ph} WHERE tenant = {self._ph} AND name = {self._ph} "
+                    f"AND version = {self._ph}",
+                    (self._dumps(payload), now, tenant, name, int(current)),
                 )
                 if cur.rowcount == 0:
                     raise ConflictError(
-                        f"“{name}” was saved by someone else a moment ago. Reload it and "
-                        "reapply your edit."
+                        f"“{name}” was saved by someone else a moment ago. "
+                        "Reload it and reapply your edit."
                     )
             if not self.is_postgres:
                 self._conn.commit()
 
-    def delete(self, name: str) -> bool:
+    def delete(self, tenant: str, name: str) -> bool:
         with self._lock:
             cur = self._conn.cursor()
-            cur.execute(f"DELETE FROM templates WHERE name = {self._ph}", (name,))
+            cur.execute(
+                f"DELETE FROM templates WHERE tenant = {self._ph} AND name = {self._ph}",
+                (clean_tenant(tenant), name),
+            )
             deleted = cur.rowcount > 0
             if not self.is_postgres:
                 self._conn.commit()
             return deleted
+
+    def tenants(self) -> list[str]:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("SELECT DISTINCT tenant FROM templates ORDER BY tenant")
+            return [str(r[0]) for r in cur.fetchall()]
 
     def record(self, event: Event) -> None:
         try:
@@ -492,11 +557,39 @@ def log(kind: str, subject: str, detail: str = "", user: str = "") -> None:
                 kind=kind,
                 subject=subject,
                 detail=detail,
-                user=user or current_user(),
+                user=user or current_user() or current_tenant(),
             )
         )
     except Exception:
         pass
+
+
+def current_tenant() -> str:
+    """
+    Which clinic is using the app right now.
+
+    Resolution order, most trustworthy first:
+
+      1. the signed-in user's email domain, when an identity provider is
+         configured - a doctor at apollo.com cannot claim to be someone else
+      2. TENANT in secrets, for a single-clinic install that never signs in
+      3. "default"
+
+    Deriving it from the sign-in matters: anything the user could type is
+    something they could type wrongly, or deliberately.
+    """
+    email = current_user()
+    if "@" in email:
+        return clean_tenant(email.split("@", 1)[1])
+
+    try:
+        import streamlit as st
+
+        if "TENANT" in st.secrets:
+            return clean_tenant(str(st.secrets["TENANT"]))
+    except Exception:
+        pass
+    return clean_tenant(os.environ.get("TENANT", "") or DEFAULT_TENANT)
 
 
 def current_user() -> str:

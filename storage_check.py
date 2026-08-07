@@ -20,6 +20,8 @@ import tempfile
 import threading
 
 import storage
+
+TENANT = "test-clinic"
 import templates
 
 failures: list[str] = []
@@ -35,38 +37,38 @@ def suite(store: storage.Store, label: str) -> None:
     print(f"\n{label} — {store.describe()}")
 
     # -- create, read back -------------------------------------------------- #
-    store.save("Dr A", {"name": "Dr A", "font_name": "Arial", "font_size": 12})
-    store.save("Dr B", {"name": "Dr B", "font_name": "Times New Roman"})
-    loaded = store.load_all()
+    store.save(TENANT, "Dr A", {"name": "Dr A", "font_name": "Arial", "font_size": 12})
+    store.save(TENANT, "Dr B", {"name": "Dr B", "font_name": "Times New Roman"})
+    loaded = store.load_all(TENANT)
     check(set(loaded) == {"Dr A", "Dr B"}, f"both templates come back ({sorted(loaded)})")
     check(loaded["Dr A"]["font_name"] == "Arial", "payload survives the round trip")
 
     # -- optimistic locking ------------------------------------------------- #
-    version = store.fingerprint("Dr A")
+    version = store.fingerprint(TENANT, "Dr A")
     check(bool(version), "a stored template has a fingerprint")
-    store.save("Dr A", {"name": "Dr A", "font_name": "Calibri"}, expect=version)
-    check(store.load_all()["Dr A"]["font_name"] == "Calibri", "a matching save goes through")
+    store.save(TENANT, "Dr A", {"name": "Dr A", "font_name": "Calibri"}, expect=version)
+    check(store.load_all(TENANT)["Dr A"]["font_name"] == "Calibri", "a matching save goes through")
 
     try:
-        store.save("Dr A", {"name": "Dr A", "font_name": "Hacked"}, expect=version)
+        store.save(TENANT, "Dr A", {"name": "Dr A", "font_name": "Hacked"}, expect=version)
         check(False, "a stale write was allowed to clobber a newer version")
     except storage.ConflictError:
         check(True, "a stale write is refused")
-    check(store.load_all()["Dr A"]["font_name"] == "Calibri",
+    check(store.load_all(TENANT)["Dr A"]["font_name"] == "Calibri",
           "the refused write left the record untouched")
 
     # -- concurrent writers: exactly one must win --------------------------- #
     # n=0 is the baseline. Writers use 1..5 so none of them writes content
     # identical to it - an idempotent re-write changes no bytes and therefore
     # correctly raises no conflict, which would muddy what this is testing.
-    store.save("Race", {"name": "Race", "n": 0})
-    base = store.fingerprint("Race")
+    store.save(TENANT, "Race", {"name": "Race", "n": 0})
+    base = store.fingerprint(TENANT, "Race")
     results: list[str] = []
     lock = threading.Lock()
 
     def writer(n: int) -> None:
         try:
-            store.save("Race", {"name": "Race", "n": n}, expect=base)
+            store.save(TENANT, "Race", {"name": "Race", "n": n}, expect=base)
             with lock:
                 results.append("won")
         except storage.ConflictError:
@@ -95,19 +97,60 @@ def suite(store: storage.Store, label: str) -> None:
     check(any(e.user == "dr@clinic" for e in rows), "the user is recorded when known")
 
     # -- delete ------------------------------------------------------------- #
-    check(store.delete("Dr B") is True, "delete reports success")
-    check("Dr B" not in store.load_all(), "the deleted template is gone")
-    check(store.delete("Dr B") is False, "deleting twice is not an error")
+    check(store.delete(TENANT, "Dr B") is True, "delete reports success")
+    check("Dr B" not in store.load_all(TENANT), "the deleted template is gone")
+    check(store.delete(TENANT, "Dr B") is False, "deleting twice is not an error")
 
     # -- a real Template round-trips through this store --------------------- #
     tpl = templates.copy_of(templates.HC_FORMAT, "Dr Real", doctor="Dr Real")
     tpl = templates.remember_dictation_fix(tpl, "colic list", "cholelithiasis")
     tpl = templates.remember_correction(tpl, "before", "after", rules=["Write calculi."])
-    store.save("Dr Real", templates.to_dict(tpl))
-    restored = templates.from_dict(store.load_all()["Dr Real"])
+    store.save(TENANT, "Dr Real", templates.to_dict(tpl))
+    restored = templates.from_dict(store.load_all(TENANT)["Dr Real"])
     check(restored.vocabulary == tpl.vocabulary, "learned vocabulary survives this store")
     check(restored.preferences == tpl.preferences, "learned rules survive this store")
     check(len(restored.corrections) == len(tpl.corrections), "corrections survive this store")
+
+
+def check_isolation(store: storage.Store, label: str) -> None:
+    """One clinic must not see, change or delete another's templates."""
+    print(f"\n{label} — tenant isolation")
+    apollo, fortis = "apollo-com", "fortis-in"
+
+    # Deliberately the same template name in both clinics.
+    store.save(apollo, "Dr. Sharad", {"name": "Dr. Sharad", "doctor": "Apollo",
+                                      "vocabulary": ["cholelithiasis"]})
+    store.save(fortis, "Dr. Sharad", {"name": "Dr. Sharad", "doctor": "Fortis"})
+
+    a, b = store.load_all(apollo), store.load_all(fortis)
+    check(a["Dr. Sharad"]["doctor"] == "Apollo" and b["Dr. Sharad"]["doctor"] == "Fortis",
+          "the same template name in two clinics stays separate")
+    check(not b["Dr. Sharad"].get("vocabulary"),
+          "one clinic's learned vocabulary does not leak into another's")
+
+    check(store.load_all("never-used-this") == {},
+          "a clinic that has saved nothing sees nothing")
+
+    # A save in one must not disturb the other.
+    store.save(apollo, "Dr. Sharad", {"name": "Dr. Sharad", "doctor": "Apollo edited"})
+    check(store.load_all(fortis)["Dr. Sharad"]["doctor"] == "Fortis",
+          "editing in one clinic leaves the other untouched")
+
+    # Nor must a delete.
+    check(store.delete(apollo, "Dr. Sharad") is True, "delete works within a clinic")
+    check("Dr. Sharad" in store.load_all(fortis),
+          "deleting in one clinic does not delete the other's")
+    check(store.delete("never-used-this", "Dr. Sharad") is False,
+          "a clinic cannot delete a template it does not own")
+
+    # Fingerprints are per clinic too, or a conflict check would compare
+    # across clinics and refuse a perfectly good save.
+    fortis_version = store.fingerprint(fortis, "Dr. Sharad")
+    check(bool(fortis_version), "a clinic can fingerprint its own template")
+    check(store.fingerprint(apollo, "Dr. Sharad") == "",
+          "a deleted template has no fingerprint in its own clinic")
+
+    store.delete(fortis, "Dr. Sharad")
 
 
 def check_migration() -> None:
@@ -117,21 +160,21 @@ def check_migration() -> None:
         files = storage.FileStore(os.path.join(workdir, "templates"))
         tpl = templates.copy_of(templates.HC_FORMAT, "Dr Move", doctor="Dr Move")
         tpl = templates.remember_vocabulary(tpl, ["cholelithiasis", "hydronephrosis"])
-        files.save("Dr Move", templates.to_dict(tpl))
+        files.save(TENANT, "Dr Move", templates.to_dict(tpl))
 
         db = storage.SqlStore(f"sqlite:///{os.path.join(workdir, 'moved.db')}")
-        for name, payload in files.load_all().items():
-            db.save(name, payload)
+        for name, payload in files.load_all(TENANT).items():
+            db.save(TENANT, name, payload)
 
-        moved = templates.from_dict(db.load_all()["Dr Move"])
+        moved = templates.from_dict(db.load_all(TENANT)["Dr Move"])
         check(moved.doctor == "Dr Move", "the template arrived in the database")
         check(moved.vocabulary == tpl.vocabulary, "its learned vocabulary came with it")
 
         # …and back again, so nobody is locked in.
         back = storage.FileStore(os.path.join(workdir, "back"))
-        for name, payload in db.load_all().items():
-            back.save(name, payload)
-        returned = templates.from_dict(back.load_all()["Dr Move"])
+        for name, payload in db.load_all(TENANT).items():
+            back.save(TENANT, name, payload)
+        returned = templates.from_dict(back.load_all(TENANT)["Dr Move"])
         check(returned.vocabulary == tpl.vocabulary, "and it survives the trip back to files")
         db.close()
     finally:
@@ -149,20 +192,23 @@ def check_fallback() -> None:
 def main() -> int:
     workdir = tempfile.mkdtemp(prefix="hcfmt_storage_")
     try:
-        suite(storage.FileStore(os.path.join(workdir, "files")), "JSON files")
+        files = storage.FileStore(os.path.join(workdir, "files"))
+        suite(files, "JSON files")
+        check_isolation(files, "JSON files")
 
         sqlite = storage.SqlStore(f"sqlite:///{os.path.join(workdir, 'test.db')}")
         suite(sqlite, "SQLite")
+        check_isolation(sqlite, "SQLite")
         sqlite.close()
 
         pg_url = os.environ.get("TEST_POSTGRES_URL", "").strip()
         if pg_url:
             pg = storage.SqlStore(pg_url)
-            for name in list(pg.load_all()):
-                pg.delete(name)
+            for name in list(pg.load_all(TENANT)):
+                pg.delete(TENANT, name)
             suite(pg, "Postgres")
-            for name in list(pg.load_all()):
-                pg.delete(name)
+            for name in list(pg.load_all(TENANT)):
+                pg.delete(TENANT, name)
             pg.close()
         else:
             print("\nPostgres — skipped (set TEST_POSTGRES_URL to a throwaway database to run it)")

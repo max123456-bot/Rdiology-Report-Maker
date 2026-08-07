@@ -331,45 +331,49 @@ ConflictError = storage.ConflictError
 # caller whichever one is in use.
 
 
-def fingerprint(name: str) -> str:
+def fingerprint(name: str, tenant: str | None = None) -> str:
     """Identity of the stored version, for detecting a concurrent edit."""
-    return storage.get_store().fingerprint(name)
+    return storage.get_store().fingerprint(tenant or storage.current_tenant(), name)
 
 
-def save(template: Template, *, expect: str | None = None) -> str:
+def save(template: Template, *, expect: str | None = None,
+         tenant: str | None = None) -> str:
     """
     Write a template.
 
     Pass `expect` (a fingerprint taken when the form was drawn) to refuse the
     write if someone else changed the same template in the meantime.
     """
-    storage.get_store().save(template.name, to_dict(template), expect=expect)
+    storage.get_store().save(
+        tenant or storage.current_tenant(), template.name, to_dict(template), expect=expect
+    )
     storage.log("template.saved", template.name,
                 f"{template.font_name} {template.font_size:g}pt, "
                 f"{len(template.examples)} example(s), {len(template.preferences)} rule(s)")
     return template.name
 
 
-def delete(name: str) -> bool:
-    removed = storage.get_store().delete(name)
+def delete(name: str, tenant: str | None = None) -> bool:
+    removed = storage.get_store().delete(tenant or storage.current_tenant(), name)
     if removed:
         storage.log("template.deleted", name)
     return removed
 
 
-def rename(old_name: str, template: Template) -> str:
+def rename(old_name: str, template: Template, tenant: str | None = None) -> str:
     """Save under the new name first, then drop the old record."""
-    written = save(template)
+    written = save(template, tenant=tenant)
     if old_name.strip() != template.name.strip():
-        storage.get_store().delete(old_name)
+        storage.get_store().delete(tenant or storage.current_tenant(), old_name)
         storage.log("template.renamed", template.name, f"was {old_name}")
     return written
 
 
-def load_all() -> dict[str, Template]:
-    """Built-in first, then every stored template, keyed by name."""
+def load_all(tenant: str | None = None) -> dict[str, Template]:
+    """Built-in first, then every template belonging to this tenant."""
     out: dict[str, Template] = {HC_FORMAT.name: _hc_format()}
-    for name, payload in storage.get_store().load_all().items():
+    scope = tenant or storage.current_tenant()
+    for name, payload in storage.get_store().load_all(scope).items():
         if name == HC_FORMAT.name:
             continue
         try:

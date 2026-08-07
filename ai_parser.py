@@ -584,6 +584,94 @@ def transcribe_repeat(
     return (response.text or "").strip()
 
 
+REVIEW_PROMPT = """You proofread a speech-to-text transcript of a radiology report.
+
+You are given the transcript and the list of terms this radiologist actually uses.
+Find words the recogniser plainly got wrong - where what it wrote is not a real
+phrase in this context, and one of the radiologist's known terms is what they
+almost certainly said.
+
+The classic case: "colic list" for "cholelithiasis". No spelling comparison
+catches that, because the letters barely overlap. You catch it because you know
+what a gallbladder finding sounds like and what the surrounding sentence means.
+
+RULES
+- Only flag something you are genuinely confident about. Two good suggestions
+  beat ten guesses; a radiologist who stops trusting these will ignore all of them.
+- Only suggest terms from the radiologist's list, or standard radiological terms
+  that obviously fit. Never invent a finding.
+- Never suggest a change to a number, a measurement, a unit or a laterality.
+  Those are for the radiologist alone - a wrong measurement is the most
+  dangerous thing this system can produce.
+- If the transcript reads correctly, return an empty list. That is a normal answer.
+
+Return JSON only:
+{"suggestions": [
+  {"heard": "exact text as it appears in the transcript",
+   "suggested": "what they almost certainly said",
+   "why": "one short clause"}
+]}"""
+
+
+def review_transcript(
+    transcript: str, template, api_key: str, model: str
+) -> list[dict]:
+    """
+    Ask the model to find mis-transcriptions the rules cannot.
+
+    Edit distance and phonetics catch a split word or a near-miss spelling.
+    They cannot catch "colic list" for "cholelithiasis" - the letters and the
+    sounds are both too far apart. Meaning is what bridges that, so this pass
+    reads the whole sentence with the doctor's vocabulary in hand.
+
+    Suggestions only. Nothing is applied without the radiologist.
+    """
+    import json as _json
+
+    from google.genai import types
+
+    vocabulary = [v for v in (getattr(template, "vocabulary", None) or []) if v.strip()]
+    fixes = [
+        f'"{c.before}" -> "{c.after}"'
+        for c in (getattr(template, "dictation_fixes", None) or [])
+        if (c.before or "").strip() and (c.after or "").strip()
+    ][-20:]
+
+    body = [f"TRANSCRIPT:\n{transcript.strip()}"]
+    if vocabulary:
+        body.append("Terms this radiologist uses:\n" + ", ".join(vocabulary))
+    if fixes:
+        body.append("Mistakes made for this radiologist before:\n" + "\n".join(fixes))
+
+    client = _client(api_key)
+    response = client.models.generate_content(
+        model=model,
+        contents=["\n\n".join(body)],
+        config=types.GenerateContentConfig(
+            system_instruction=REVIEW_PROMPT,
+            response_mime_type="application/json",
+            temperature=0.0,
+        ),
+    )
+
+    data = _json.loads(response.text or "{}")
+    out = []
+    for item in data.get("suggestions") or []:
+        if not isinstance(item, dict):
+            continue
+        heard = str(item.get("heard") or "").strip()
+        suggested = str(item.get("suggested") or "").strip()
+        # A suggestion that is not actually in the transcript cannot be applied,
+        # and one that changes a number is refused on principle.
+        if not heard or not suggested or heard not in transcript:
+            continue
+        if any(ch.isdigit() for ch in heard) or any(ch.isdigit() for ch in suggested):
+            continue
+        out.append({"heard": heard, "suggested": suggested,
+                    "why": str(item.get("why") or "").strip()})
+    return out
+
+
 def distill_vocabulary(
     heard: str, corrected: str, template, api_key: str, model: str
 ) -> list[str]:

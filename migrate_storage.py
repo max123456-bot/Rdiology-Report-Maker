@@ -44,6 +44,10 @@ def main() -> int:
                         help="Where they should go: 'files', a sqlite:/// path, or a postgresql:// URL")
     parser.add_argument("--overwrite", action="store_true",
                         help="Replace templates that already exist in the target")
+    parser.add_argument("--tenant", default="",
+                        help="Which clinic's templates to move. Default: the configured tenant")
+    parser.add_argument("--to-tenant", default="",
+                        help="Write them under a different tenant. Default: same as --tenant")
     parser.add_argument("--dry-run", action="store_true", help="Report only, change nothing")
     args = parser.parse_args()
 
@@ -57,12 +61,19 @@ def main() -> int:
     print(f"From: {source.describe()}")
     print(f"To:   {target.describe()}")
 
-    records = source.load_all()
+    from_tenant = storage.clean_tenant(args.tenant or storage.current_tenant())
+    to_tenant = storage.clean_tenant(args.to_tenant or from_tenant)
+    if from_tenant != to_tenant:
+        print(f"Tenant: {from_tenant} -> {to_tenant}")
+    else:
+        print(f"Tenant: {from_tenant}")
+
+    records = source.load_all(from_tenant)
     if not records:
         print("\nNothing to migrate — the source has no templates.")
         return 0
 
-    existing = target.load_all()
+    existing = target.load_all(to_tenant)
     moved = skipped = failed = 0
 
     print(f"\n{len(records)} template(s) found:\n")
@@ -91,7 +102,7 @@ def main() -> int:
             continue
 
         try:
-            target.save(name, payload)
+            target.save(to_tenant, name, payload)
             print(f"  OK    {name} — {summary}")
             moved += 1
         except Exception as exc:

@@ -270,8 +270,11 @@ def _template_cache() -> dict:
 
 def load_templates() -> dict:
     cache = _template_cache()
-    if cache["data"] is None:
-        cache["data"] = templates.load_all()
+    tenant = storage.current_tenant()
+    # Keyed by tenant so one clinic's cache can never be served to another.
+    if cache["data"] is None or cache.get("tenant") != tenant:
+        cache["tenant"] = tenant
+        cache["data"] = templates.load_all(tenant)
     return cache["data"]
 
 
@@ -1282,13 +1285,27 @@ with tab_dictate:
                     # figures, units normalised. Costs nothing and cannot invent.
                     cleaned = dictation_fix.clean(result["transcript"], template.vocabulary)
                     result["transcript"] = cleaned.text
+                    suggestions = [
+                        {"heard": x.heard, "suggested": x.suggested,
+                         "confidence": x.confidence, "why": f"{x.reason} match"}
+                        for x in (cleaned.suggestions or [])
+                    ]
+                    # Rules catch split words and near-miss spellings. Meaning
+                    # catches the rest - "colic list" for "cholelithiasis" is
+                    # too far away for any letter or sound comparison.
+                    already = {s["heard"] for s in suggestions}
+                    try:
+                        for extra in ai_parser.review_transcript(
+                            cleaned.text, template, api_key, model_choice
+                        ):
+                            if extra["heard"] not in already:
+                                suggestions.append({**extra, "confidence": 0.0})
+                    except Exception:
+                        pass  # a proofread that fails must not lose the transcript
+
                     st.session_state["dict_cleanup"] = {
                         "note": cleaned.note,
-                        "suggestions": [
-                            {"heard": x.heard, "suggested": x.suggested,
-                             "confidence": x.confidence}
-                            for x in (cleaned.suggestions or [])
-                        ],
+                        "suggestions": suggestions,
                     }
 
                     st.session_state["dict_result"] = result
@@ -1413,10 +1430,13 @@ with tab_dictate:
             cleanup = st.session_state.get("dict_cleanup") or {}
             if cleanup.get("note"):
                 st.caption(f"Tidied automatically: {cleanup['note']}.")
-            for hit in cleanup.get("suggestions", [])[:6]:
+            for hit in cleanup.get("suggestions", [])[:8]:
+                why = hit.get("why") or "similar to a term you use"
+                if hit.get("confidence"):
+                    why += f" · {int(hit['confidence'] * 100)}%"
                 st.info(
-                    f"Heard **{hit['heard']}** — did you mean **{hit['suggested']}**? "
-                    f"({int(hit['confidence'] * 100)}% similar to a term you use)",
+                    f"Heard **{hit['heard']}** — did you mean **{hit['suggested']}**?\n\n"
+                    f"_{why}_",
                     icon=":material/spellcheck:",
                 )
 
