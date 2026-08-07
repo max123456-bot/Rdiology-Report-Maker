@@ -1,0 +1,345 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Live dictation</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: transparent;
+               font-family: "Source Sans Pro", Arial, Helvetica, sans-serif; }
+
+  #root { display: flex; flex-direction: column; gap: 10px; }
+
+  .bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+  button {
+    border: 1px solid #d0d6e0; background: #fff; color: #1f2937;
+    border-radius: 8px; padding: 9px 16px; font-size: 14px; cursor: pointer;
+    font-family: inherit;
+  }
+  button:hover:not(:disabled) { background: #f2f6fc; border-color: #9fb6d8; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.rec { background: #e8433a; border-color: #e8433a; color: #fff; font-weight: 600; }
+  button.rec:hover:not(:disabled) { background: #cf372f; border-color: #cf372f; }
+  button.stop { background: #1f2937; border-color: #1f2937; color: #fff; font-weight: 600; }
+
+  #dot {
+    width: 11px; height: 11px; border-radius: 50%; background: #c9d0da;
+    flex: 0 0 auto;
+  }
+  #dot.live { background: #e8433a; animation: pulse 1.1s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+
+  #status { font-size: 13px; color: #5a6b83; }
+  #timer { font-size: 13px; color: #5a6b83; font-variant-numeric: tabular-nums; }
+
+  /* Level meter - proves the mic is actually hearing something. */
+  #meter { flex: 1 1 120px; height: 6px; background: #e7ebf1; border-radius: 3px;
+           overflow: hidden; min-width: 80px; }
+  #level { height: 100%; width: 0%; background: #3ea15b; transition: width .08s linear; }
+  #meter.hot #level { background: #e8b53a; }
+
+  #box {
+    min-height: 190px; max-height: 460px; overflow-y: auto;
+    border: 1px solid #d5dae2; border-radius: 10px; padding: 14px 16px;
+    background: #fff; color: #111; font-size: 15px; line-height: 1.65;
+    white-space: pre-wrap; outline: none;
+  }
+  #box:focus { border-color: #9fb6d8; box-shadow: 0 0 0 3px rgba(120,160,220,.16); }
+  #box.empty::before {
+    content: attr(data-placeholder); color: #9aa4b2;
+  }
+  #interim { color: #8a94a3; font-style: italic; }
+
+  .hint { font-size: 12.5px; color: #7a8699; }
+  .warn { font-size: 13px; color: #8a5a00; background: #fff6e5;
+          border: 1px solid #f0dcae; border-radius: 8px; padding: 9px 12px; }
+</style>
+</head>
+<body>
+  <div id="root">
+    <div class="bar">
+      <button id="start" class="rec" type="button">● Start speaking</button>
+      <button id="stop" class="stop" type="button" disabled>■ Stop &amp; transcribe</button>
+      <span id="dot"></span>
+      <span id="timer">00:00</span>
+      <div id="meter"><div id="level"></div></div>
+      <span id="status">Ready</span>
+    </div>
+
+    <div id="box" contenteditable="true" spellcheck="false"
+         data-placeholder="Your words appear here as you speak. You can edit them at any time."></div>
+
+    <div class="hint" id="hint">
+      Speak normally. You can type or correct in the box while you talk.
+    </div>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ------------------------------------------------------------------ //
+  // Streamlit component protocol
+  // ------------------------------------------------------------------ //
+  function post(type, data) {
+    var msg = { isStreamlitMessage: true, type: type };
+    for (var k in data) msg[k] = data[k];
+    window.parent.postMessage(msg, "*");
+  }
+  function setValue(v) { post("streamlit:setComponentValue", { value: v, dataType: "json" }); }
+
+  var lastH = 0;
+  function syncHeight() {
+    var root = document.getElementById("root");
+    if (!root) return;
+    var h = Math.ceil(root.getBoundingClientRect().height) + 10;
+    if (Math.abs(h - lastH) > 1) { lastH = h; post("streamlit:setFrameHeight", { height: h }); }
+  }
+
+  var startBtn = document.getElementById("start");
+  var stopBtn  = document.getElementById("stop");
+  var box      = document.getElementById("box");
+  var statusEl = document.getElementById("status");
+  var timerEl  = document.getElementById("timer");
+  var dot      = document.getElementById("dot");
+  var level    = document.getElementById("level");
+  var meter    = document.getElementById("meter");
+  var hint     = document.getElementById("hint");
+
+  var finalText = "";
+  var interimText = "";
+  var recognition = null;
+  var recognitionWanted = false;
+  var recorder = null;
+  var chunks = [];
+  var stream = null;
+  var audioCtx = null, analyser = null, rafId = null;
+  var startedAt = 0, tickId = null;
+  var MAX_MB = 12;
+
+  function setStatus(text) { statusEl.textContent = text; syncHeight(); }
+
+  function render() {
+    var safe = function (s) {
+      return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    };
+    // Only repaint while listening; once stopped the box is the doctor's to edit
+    // freely and must not be overwritten under the caret.
+    box.innerHTML = safe(finalText) + (interimText ? '<span id="interim">' + safe(interimText) + "</span>" : "");
+    box.classList.toggle("empty", !finalText && !interimText);
+    box.scrollTop = box.scrollHeight;
+    syncHeight();
+  }
+
+  function fmt(seconds) {
+    var m = Math.floor(seconds / 60), s = seconds % 60;
+    return (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s;
+  }
+
+  // ------------------------------------------------------------------ //
+  // Live speech-to-text (browser). Instant feedback, not the final answer.
+  // ------------------------------------------------------------------ //
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+  function startRecognition() {
+    if (!SR) return;
+    recognition = new SR();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = document.documentElement.lang || "en-IN";
+    recognition.maxAlternatives = 1;
+
+    recognition.onresult = function (event) {
+      interimText = "";
+      for (var i = event.resultIndex; i < event.results.length; i++) {
+        var chunk = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          finalText += (finalText && !/\s$/.test(finalText) ? " " : "") + chunk.trim();
+        } else {
+          interimText += chunk;
+        }
+      }
+      render();
+    };
+
+    recognition.onerror = function (event) {
+      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+        setStatus("Microphone blocked — allow it in the browser and start again.");
+        recognitionWanted = false;
+      } else if (event.error === "no-speech") {
+        setStatus("Listening — nothing heard yet.");
+      }
+    };
+
+    // Chrome stops on its own after a pause; restart while the doctor is still going.
+    recognition.onend = function () {
+      if (recognitionWanted) {
+        try { recognition.start(); } catch (e) { /* already starting */ }
+      }
+    };
+
+    try { recognition.start(); } catch (e) { /* already started */ }
+  }
+
+  function stopRecognition() {
+    recognitionWanted = false;
+    if (recognition) {
+      try { recognition.stop(); } catch (e) {}
+      recognition = null;
+    }
+    if (interimText) {
+      finalText += (finalText && !/\s$/.test(finalText) ? " " : "") + interimText;
+      interimText = "";
+      render();
+    }
+  }
+
+  // ------------------------------------------------------------------ //
+  // Level meter - so a dead mic is obvious immediately, not after speaking
+  // a whole report into nothing.
+  // ------------------------------------------------------------------ //
+  function startMeter(mediaStream) {
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      var source = audioCtx.createMediaStreamSource(mediaStream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
+      var data = new Uint8Array(analyser.frequencyBinCount);
+
+      var quietFor = 0;
+      (function loop() {
+        analyser.getByteTimeDomainData(data);
+        var peak = 0;
+        for (var i = 0; i < data.length; i++) {
+          peak = Math.max(peak, Math.abs(data[i] - 128));
+        }
+        var pct = Math.min(100, Math.round((peak / 128) * 260));
+        level.style.width = pct + "%";
+        meter.classList.toggle("hot", pct > 88);
+
+        quietFor = pct < 3 ? quietFor + 1 : 0;
+        if (quietFor === 150) setStatus("Hearing nothing — check the microphone.");
+        rafId = requestAnimationFrame(loop);
+      })();
+    } catch (e) { /* meter is a nicety, never fatal */ }
+  }
+
+  function stopMeter() {
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+    level.style.width = "0%";
+    if (audioCtx) { try { audioCtx.close(); } catch (e) {} audioCtx = null; }
+  }
+
+  // ------------------------------------------------------------------ //
+  // Recording. The audio is what gets the accurate transcription.
+  // ------------------------------------------------------------------ //
+  startBtn.addEventListener("click", function () {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus("This browser cannot record audio.");
+      return;
+    }
+    navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    }).then(function (s) {
+      stream = s;
+      chunks = [];
+      finalText = box.innerText.replace(/ /g, " ").trim();  // keep anything already typed
+      interimText = "";
+      render();
+
+      var mime = "";
+      ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"]
+        .some(function (m) {
+          if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) { mime = m; return true; }
+          return false;
+        });
+
+      recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+      recorder.ondataavailable = function (e) { if (e.data && e.data.size) chunks.push(e.data); };
+      recorder.onstop = finish;
+      recorder.start();
+
+      recognitionWanted = true;
+      startRecognition();
+      startMeter(stream);
+
+      startedAt = Date.now();
+      tickId = setInterval(function () {
+        timerEl.textContent = fmt(Math.floor((Date.now() - startedAt) / 1000));
+      }, 500);
+
+      dot.classList.add("live");
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      setStatus(SR ? "Listening…" : "Recording (this browser has no live preview)");
+      if (!SR) {
+        hint.innerHTML = '<span class="warn">Live preview needs Chrome or Edge. Recording ' +
+          'still works here, and the accurate transcription is unaffected.</span>';
+      }
+    }).catch(function () {
+      setStatus("Microphone blocked. Allow it in the browser, then start again.");
+    });
+  });
+
+  stopBtn.addEventListener("click", function () {
+    stopBtn.disabled = true;
+    setStatus("Finishing…");
+    stopRecognition();
+    stopMeter();
+    if (tickId) { clearInterval(tickId); tickId = null; }
+    dot.classList.remove("live");
+    if (recorder && recorder.state !== "inactive") recorder.stop();
+    else finish();
+  });
+
+  function finish() {
+    if (stream) {
+      stream.getTracks().forEach(function (t) { t.stop(); });
+      stream = null;
+    }
+    var seconds = Math.round((Date.now() - startedAt) / 1000);
+    var blob = new Blob(chunks, { type: (recorder && recorder.mimeType) || "audio/webm" });
+
+    if (blob.size > MAX_MB * 1024 * 1024) {
+      setStatus("Recording too long (" + Math.round(blob.size / 1048576) + " MB). " +
+                "Dictate in shorter passes.");
+      startBtn.disabled = false;
+      return;
+    }
+
+    var reader = new FileReader();
+    reader.onloadend = function () {
+      var base64 = String(reader.result).split(",")[1] || "";
+      setValue({
+        text: box.innerText.replace(/ /g, " ").trim(),
+        audio: base64,
+        mime: (blob.type || "audio/webm").split(";")[0],
+        seconds: seconds,
+        live_available: !!SR,
+        nonce: Date.now()
+      });
+      setStatus("Done — " + fmt(seconds) + " recorded. Transcribing…");
+      startBtn.disabled = false;
+    };
+    reader.readAsDataURL(blob);
+  }
+
+  // The doctor editing the box is the doctor's business; just keep the height right.
+  box.addEventListener("input", function () {
+    box.classList.toggle("empty", !box.innerText.trim());
+    syncHeight();
+  });
+
+  render();
+  post("streamlit:componentReady", { apiVersion: 1 });
+  syncHeight();
+  if (window.ResizeObserver) {
+    new ResizeObserver(syncHeight).observe(document.getElementById("root"));
+  }
+})();
+</script>
+</body>
+</html>

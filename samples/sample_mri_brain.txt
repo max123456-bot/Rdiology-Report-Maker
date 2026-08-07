@@ -1,0 +1,32 @@
+MRI Brain with Contrast Report
+
+Patient Name: Mr. Ramesh Kumar
+Age/Sex: 54 Years / Male
+Examination: MRI Brain with contrast
+Clinical History: Recurrent headache since 3 months with episodes of giddiness. Known hypertensive.
+Technique: Multiplanar multiecho T1W, T2W, FLAIR, DWI and SWI sequences were obtained. Post contrast T1W fat saturated images were acquired in axial, coronal and sagittal planes after intravenous administration of 10 ml of Gadolinium based contrast agent.
+
+Findings:
+Brain parenchyma
+- A well defined altered signal intensity lesion measuring approximately 2.4 x 1.9 x 1.8 cm is noted in the left frontal lobe, appearing hypointense on T1W and hyperintense on T2W/FLAIR images, with surrounding perilesional vasogenic oedema causing mild mass effect on the adjacent left lateral ventricle.
+- The lesion shows heterogeneous post contrast enhancement with a small central non enhancing area suggestive of necrosis.
+Ventricular system
+- The lateral, third and fourth ventricles are normal in size and configuration. No evidence of periventricular ooze or hydrocephalus.
+Posterior fossa
+- The cerebellar hemispheres, vermis and brainstem reveal normal signal intensity. No focal lesion is seen.
+Sella and parasellar region
+- The pituitary gland is normal in size, shape and signal intensity. The cavernous sinuses are symmetrical.
+Vascular structures
+- Flow voids of the major intracranial arteries are preserved.
+
+Impression:
+1. Left frontal lobe space occupying lesion measuring 2.4 x 1.9 x 1.8 cm with perilesional vasogenic oedema and heterogeneous post contrast enhancement, likely representing a high grade glial neoplasm.
+2. No evidence of hydrocephalus or midline shift beyond 4 mm.
+
+Recommendation:
+MR spectroscopy and perfusion imaging for further characterisation. Neurosurgical opinion is advised.
+
+Please correlate clinically and with previous imaging if available.
+Thanks for the referral,
+DR. ABHIJEET SHARMA
+M.D. RADIOLOGY

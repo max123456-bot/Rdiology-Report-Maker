@@ -1,0 +1,16 @@
+streamlit>=1.36
+python-docx>=1.1.0
+pypdf>=4.2.0
+
+# Optional — only needed for the AI-assisted engine and AI OCR of scans/photos
+google-genai>=1.0.0
+
+# Optional — PDF export, requires Microsoft Word installed locally (Windows/macOS)
+# docx2pdf>=0.1.8
+
+# Optional - AI4Bharat speech recognition in the Dictate tab.
+# Audio conversion (also needs ffmpeg on PATH):
+# pydub>=0.25.1
+# Running AI4Bharat locally instead of via Hugging Face:
+# torch
+# transformers>=4.40

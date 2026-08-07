@@ -1,0 +1,28 @@
+# Clinical palette: teal for anything the app is confident about, orange reserved
+# for the one action on each screen, red only for a genuine failure. Chosen for
+# WCAG AA contrast on white, because reports get read on bad monitors in bright
+# rooms.
+
+[theme]
+base = "light"
+primaryColor = "#0D9488"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F9F9"
+textColor = "#12343B"
+linkColor = "#0F766E"
+codeBackgroundColor = "#F0FDFA"
+font = "sans-serif"
+baseRadius = "0.5rem"
+borderColor = "#D8E3E3"
+showWidgetBorder = true
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = true
+
+[server]
+# A radiology report is text. 25 MB is already generous and matches readers.MAX_BYTES.
+maxUploadSize = 25
+
+[browser]
+gatherUsageStats = false

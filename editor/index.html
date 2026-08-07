@@ -1,0 +1,554 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>HC Format editor</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; background: transparent;
+    font-family: Arial, Helvetica, sans-serif;
+  }
+
+  /* The page mirrors what Word will render: Arial 12 pt, black, on white. */
+  #page {
+    background: #ffffff;
+    color: #000000;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 12pt;
+    line-height: 1.5;   /* HC FORMAT rule 2 - must match LINE_SPACING in hc_format.py */
+    padding: 30px 34px 22px;
+    border: 1px solid #d5d5d5;
+    border-radius: 6px;
+  }
+
+  .row {
+    display: grid;
+    grid-template-columns: 26px 1fr;
+    gap: 6px;
+    align-items: start;
+    position: relative;
+    border-radius: 4px;
+  }
+  .row:hover { background: #f7f9fc; }
+  .row:focus-within { background: #f2f7ff; }
+
+  /* Left gutter: format control, faded until the line is hovered or focused. */
+  .gutter {
+    opacity: 0;
+    transition: opacity .12s ease;
+    padding-top: 3px;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  .row:hover .gutter, .row:focus-within .gutter { opacity: 1; }
+  .gutter button {
+    width: 22px; height: 22px;
+    border: 1px solid #ccd3dd;
+    background: #fff;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    line-height: 1;
+    color: #4a5568;
+    padding: 0;
+  }
+  .gutter button:hover { background: #eef3fb; border-color: #8fa8cc; }
+
+  .content, .label, .value { outline: none; }
+  .content:focus, .label:focus, .value:focus {
+    box-shadow: inset 0 -2px 0 #b9d0f0;
+  }
+
+  /* HC FORMAT rules, rendered exactly as build_docx will write them. */
+  .k-title    { text-align: center; font-weight: 700; text-decoration: underline;
+                text-transform: uppercase; margin: 0 0 12px; }
+  .k-heading  { font-weight: 700; text-decoration: underline; text-transform: uppercase;
+                margin: 12px 0 3px; }
+  .k-subheading { font-style: italic; text-decoration: underline; font-weight: 400;
+                margin: 7px 0 2px; }
+  .k-text     { margin: 0 0 4px; }
+  /* As-is mode: every space, tab and blank line is content. */
+  .k-verbatim { margin: 0; white-space: pre-wrap; min-height: 1.2em; }
+  .k-bullet, .k-bold_bullet {
+    margin: 0 0 4px; padding-left: 24px; text-indent: -13px;
+  }
+  .k-bullet::before, .k-bold_bullet::before { content: "•\00a0\00a0"; }
+  .k-bold_bullet { font-weight: 700; }
+
+  .k-heading_inline { margin: 4px 0 2px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .k-heading_inline .label {
+    font-weight: 700; text-decoration: underline; text-transform: uppercase;
+    white-space: pre;
+  }
+  .k-heading_inline .value { font-weight: 400; text-decoration: none; flex: 1 1 200px; }
+
+  /* Format menu */
+  #menu {
+    position: absolute; z-index: 50; display: none;
+    background: #fff; border: 1px solid #ccd3dd; border-radius: 6px;
+    box-shadow: 0 6px 22px rgba(20, 30, 50, .16);
+    padding: 4px; min-width: 232px;
+    font-size: 13px; font-family: Arial, Helvetica, sans-serif;
+  }
+  #menu button {
+    display: block; width: 100%; text-align: left;
+    border: 0; background: transparent; cursor: pointer;
+    padding: 6px 9px; border-radius: 4px; color: #1f2937; font-size: 13px;
+  }
+  #menu button:hover { background: #eef3fb; }
+  #menu button.on { background: #e2ecfb; font-weight: 700; }
+  #menu .sep { height: 1px; background: #e7ebf1; margin: 4px 2px; }
+
+  /* Rich-text toolbar, shown while text is selected */
+  #rt {
+    position: absolute; z-index: 60; display: none;
+    background: #1f2937; border-radius: 6px; padding: 3px;
+    box-shadow: 0 6px 18px rgba(15, 23, 42, .3);
+    font-family: Arial, Helvetica, sans-serif;
+  }
+  #rt button {
+    border: 0; background: transparent; color: #fff; cursor: pointer;
+    width: 30px; height: 26px; border-radius: 4px; font-size: 13px;
+  }
+  #rt button:hover { background: #374151; }
+  #rt button b { font-weight: 700; }
+  #rt button i { font-style: italic; }
+  #rt button u { text-decoration: underline; }
+
+  #addline {
+    margin-top: 10px; border: 1px dashed #c8d2e0; background: #fff;
+    color: #5a6b83; border-radius: 5px; padding: 5px 11px;
+    cursor: pointer; font-size: 12px; font-family: Arial, Helvetica, sans-serif;
+  }
+  #addline:hover { background: #f3f7fd; color: #23303f; }
+
+  #hint {
+    margin-top: 9px; color: #7a8699; font-size: 11.5px;
+    font-family: Arial, Helvetica, sans-serif;
+  }
+</style>
+</head>
+<body>
+  <div id="root">
+    <div id="page"></div>
+    <button id="addline" type="button">+ Add a line at the end</button>
+    <div id="hint">
+      Click any line and type. <b>Enter</b> makes a new line of the same format ·
+      <b>Backspace</b> on an empty line deletes it · the small button on the left
+      changes a line's format.
+    </div>
+  </div>
+  <div id="menu"></div>
+  <div id="rt">
+    <button type="button" data-cmd="bold" title="Bold (Ctrl+B)"><b>B</b></button>
+    <button type="button" data-cmd="italic" title="Italic (Ctrl+I)"><i>I</i></button>
+    <button type="button" data-cmd="underline" title="Underline (Ctrl+U)"><u>U</u></button>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ----------------------------------------------------------------- //
+  // Streamlit component protocol, hand-rolled (no build step needed).
+  // ----------------------------------------------------------------- //
+  function post(type, data) {
+    var msg = { isStreamlitMessage: true, type: type };
+    for (var k in data) msg[k] = data[k];
+    window.parent.postMessage(msg, "*");
+  }
+  function setValue(value) {
+    post("streamlit:setComponentValue", { value: value, dataType: "json" });
+  }
+  // Height must be measured from the content, never from the document: Streamlit
+  // sizes the iframe to whatever we report, and documentElement.scrollHeight then
+  // includes that size, so reporting it feeds back and the frame grows forever.
+  var lastHeight = 0;
+  function syncHeight() {
+    var root = document.getElementById("root");
+    if (!root) return;
+    var h = Math.ceil(root.getBoundingClientRect().height) + 8;
+    if (Math.abs(h - lastHeight) > 1) {
+      lastHeight = h;
+      post("streamlit:setFrameHeight", { height: h });
+    }
+  }
+
+  var KINDS = [
+    ["title",          "Title — centred, bold, underlined"],
+    ["heading",        "Main heading — bold, underlined"],
+    ["heading_inline", "Heading + value on one line"],
+    ["subheading",     "Organ subheading — italic, underlined"],
+    ["bullet",         "Finding bullet"],
+    ["bold_bullet",    "Impression bullet — bold"],
+    ["text",           "Plain text"],
+    ["verbatim",       "As-is line — spacing preserved"]
+  ];
+  var KIND_SET = {};
+  KINDS.forEach(function (k) { KIND_SET[k[0]] = k[1]; });
+
+  var page = document.getElementById("page");
+  var menu = document.getElementById("menu");
+  var currentNonce = null;
+
+  // ----------------------------------------------------------------- //
+  // Rich text: spans in, spans out
+  // ----------------------------------------------------------------- //
+
+  // Put text into an editable element, rebuilding any bold/italic/underline
+  // the user applied earlier. Plain text stays a plain text node.
+  function fill(el, text, spans) {
+    el.textContent = "";
+    if (!spans || !spans.length) { el.textContent = text || ""; return; }
+    spans.forEach(function (s) {
+      var node = document.createTextNode(s.text);
+      if (s.underline) { var u = document.createElement("u"); u.appendChild(node); node = u; }
+      if (s.italic)    { var i = document.createElement("i"); i.appendChild(node); node = i; }
+      if (s.bold)      { var b = document.createElement("b"); b.appendChild(node); node = b; }
+      el.appendChild(node);
+    });
+  }
+
+  // Read an editable element back as spans. Flags are additions on top of the
+  // line's format, so italicising a word in an IMPRESSION bullet keeps rule 6's
+  // bold and adds italic.
+  function spansOf(el) {
+    var out = [];
+    (function walk(node, st) {
+      if (node.nodeType === 3) {
+        if (node.nodeValue) out.push({ text: node.nodeValue, bold: st.b, italic: st.i, underline: st.u });
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      var tag = (node.tagName || "").toLowerCase();
+      if (tag === "br") { out.push({ text: " ", bold: st.b, italic: st.i, underline: st.u }); return; }
+      var style = node.style || {};
+      var weight = String(style.fontWeight || "");
+      var next = {
+        b: st.b || tag === "b" || tag === "strong" || weight === "bold" || Number(weight) >= 600,
+        i: st.i || tag === "i" || tag === "em" || style.fontStyle === "italic",
+        u: st.u || tag === "u" || String(style.textDecoration || "").indexOf("underline") >= 0
+      };
+      for (var c = node.firstChild; c; c = c.nextSibling) walk(c, next);
+    })(el, { b: false, i: false, u: false });
+
+    // Merge neighbours that carry identical emphasis.
+    var merged = [];
+    out.forEach(function (s) {
+      var last = merged[merged.length - 1];
+      if (last && last.bold === s.bold && last.italic === s.italic && last.underline === s.underline) {
+        last.text += s.text;
+      } else {
+        merged.push({ text: s.text, bold: s.bold, italic: s.italic, underline: s.underline });
+      }
+    });
+    // A single unformatted span carries no information the plain text lacks.
+    if (merged.length === 1 && !merged[0].bold && !merged[0].italic && !merged[0].underline) return [];
+    return merged;
+  }
+
+  // ----------------------------------------------------------------- //
+  // Rendering
+  // ----------------------------------------------------------------- //
+  function makeRow(block) {
+    var kind = KIND_SET[block.kind] ? block.kind : "text";
+
+    var row = document.createElement("div");
+    row.className = "row";
+    row.dataset.kind = kind;
+
+    var gutter = document.createElement("div");
+    gutter.className = "gutter";
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = "¶";
+    btn.title = "Change this line's format";
+    btn.addEventListener("mousedown", function (e) { e.preventDefault(); });
+    btn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      openMenu(row, btn);
+    });
+    gutter.appendChild(btn);
+
+    var body = document.createElement("div");
+    body.className = "k-" + kind;
+
+    if (kind === "heading_inline") {
+      var label = document.createElement("span");
+      label.className = "label";
+      label.contentEditable = "true";
+      fill(label, block.text, block.spans);
+      var value = document.createElement("span");
+      value.className = "value";
+      value.contentEditable = "true";
+      fill(value, block.value, block.value_spans);
+      body.appendChild(label);
+      body.appendChild(value);
+    } else {
+      body.classList.add("content");
+      body.contentEditable = "true";
+      fill(body, block.text, block.spans);
+    }
+
+    row.appendChild(gutter);
+    row.appendChild(body);
+    return row;
+  }
+
+  function render(blocks) {
+    page.innerHTML = "";
+    (blocks || []).forEach(function (b) { page.appendChild(makeRow(b)); });
+    if (!page.children.length) {
+      page.appendChild(makeRow({ kind: "title", text: "" }));
+    }
+    syncHeight();
+  }
+
+  // Change a row's format in place, preserving its text.
+  function setKind(row, kind) {
+    var wasInline = row.dataset.kind === "heading_inline";
+    var text, value = "", spans = [], valueSpans = [];
+    if (wasInline) {
+      text = row.querySelector(".label").textContent;
+      value = row.querySelector(".value").textContent;
+      spans = spansOf(row.querySelector(".label"));
+      valueSpans = spansOf(row.querySelector(".value"));
+    } else {
+      text = row.querySelector(".content").textContent;
+      spans = spansOf(row.querySelector(".content"));
+    }
+    // Moving away from heading+value must not silently drop the value.
+    if (wasInline && kind !== "heading_inline" && value.trim()) {
+      text = (text.trim() + " " + value.trim()).trim();
+      spans = [];  // the two halves merge, so their emphasis maps are no longer valid
+      value = "";
+      valueSpans = [];
+    }
+    var fresh = makeRow({ kind: kind, text: text, value: value, spans: spans, value_spans: valueSpans });
+    row.replaceWith(fresh);
+    focusEnd(fresh.querySelector(".content") || fresh.querySelector(".label"));
+    commit(true);
+  }
+
+  // ----------------------------------------------------------------- //
+  // Format menu
+  // ----------------------------------------------------------------- //
+  function openMenu(row, anchor) {
+    menu.innerHTML = "";
+    KINDS.forEach(function (pair, i) {
+      var item = document.createElement("button");
+      item.type = "button";
+      item.textContent = pair[1];
+      if (row.dataset.kind === pair[0]) item.className = "on";
+      item.addEventListener("click", function () {
+        closeMenu();
+        setKind(row, pair[0]);
+      });
+      menu.appendChild(item);
+      if (i === 0 || i === 3) {
+        var sep = document.createElement("div");
+        sep.className = "sep";
+        menu.appendChild(sep);
+      }
+    });
+
+    var box = anchor.getBoundingClientRect();
+    menu.style.display = "block";
+    menu.style.left = (box.left + window.scrollX) + "px";
+    menu.style.top = (box.bottom + window.scrollY + 4) + "px";
+    syncHeight();
+  }
+  function closeMenu() { menu.style.display = "none"; }
+  document.addEventListener("click", closeMenu);
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeMenu(); });
+
+  // ----------------------------------------------------------------- //
+  // Caret helpers
+  // ----------------------------------------------------------------- //
+  function focusEnd(el) {
+    if (!el) return;
+    el.focus();
+    var range = document.createRange();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    var sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+  function caretAtStart(el) {
+    var sel = window.getSelection();
+    if (!sel.rangeCount) return false;
+    var range = sel.getRangeAt(0).cloneRange();
+    range.selectNodeContents(el);
+    range.setEnd(sel.getRangeAt(0).startContainer, sel.getRangeAt(0).startOffset);
+    return range.toString().length === 0;
+  }
+  function editableOf(row) {
+    return row.querySelector(".content") || row.querySelector(".label");
+  }
+
+  // ----------------------------------------------------------------- //
+  // Typing behaviour
+  // ----------------------------------------------------------------- //
+  page.addEventListener("keydown", function (e) {
+    var row = e.target.closest(".row");
+    if (!row) return;
+
+    if (e.key === "Enter") {
+      e.preventDefault();
+      // A document has one title, so Enter after it starts a plain line.
+      var kind = row.dataset.kind === "title" ? "text" : row.dataset.kind;
+      var fresh = makeRow({ kind: kind, text: "", value: "" });
+      row.after(fresh);
+      focusEnd(editableOf(fresh));
+      commit();
+      return;
+    }
+
+    if (e.key === "Backspace") {
+      var field = e.target;
+      if (field.textContent.length === 0 && caretAtStart(field) && page.children.length > 1) {
+        var isSecondField = field.classList.contains("value");
+        if (isSecondField) return;  // let the label keep its own backspace
+        e.preventDefault();
+        var prev = row.previousElementSibling;
+        row.remove();
+        if (prev) focusEnd(prev.querySelector(".value") || editableOf(prev));
+        commit(true);
+      }
+    }
+  });
+
+  // Paste as plain text - never let Word/HTML styling into the document.
+  page.addEventListener("paste", function (e) {
+    if (!e.target.closest(".row")) return;
+    e.preventDefault();
+    var text = (e.clipboardData || window.clipboardData).getData("text/plain");
+    document.execCommand("insertText", false, text.replace(/\r?\n/g, " "));
+  });
+
+  // ----------------------------------------------------------------- //
+  // Serialise back to Python
+  // ----------------------------------------------------------------- //
+  function collect() {
+    var out = [];
+    Array.prototype.forEach.call(page.children, function (row) {
+      var kind = row.dataset.kind;
+      // In as-is mode the leading spaces ARE the content, so never trim them.
+      var clean = kind === "verbatim" ? function (s) { return s; }
+                                      : function (s) { return s.trim(); };
+      var text, value = "", spans = [], valueSpans = [];
+      if (kind === "heading_inline") {
+        var label = row.querySelector(".label");
+        var val = row.querySelector(".value");
+        text = clean(label.textContent);
+        value = clean(val.textContent);
+        spans = spansOf(label);
+        valueSpans = spansOf(val);
+      } else {
+        var content = row.querySelector(".content");
+        text = clean(content.textContent);
+        spans = spansOf(content);
+      }
+      if (kind !== "verbatim" && !text && !value) return;  // an emptied line is a deletion
+      if (kind === "title" || kind === "heading" || kind === "heading_inline") {
+        text = text.toUpperCase();
+        spans = spans.map(function (s) {
+          return { text: s.text.toUpperCase(), bold: s.bold, italic: s.italic, underline: s.underline };
+        });
+      }
+      out.push({ kind: kind, text: text, value: value, spans: spans, value_spans: valueSpans });
+    });
+    return out;
+  }
+
+  // ----------------------------------------------------------------- //
+  // Rich-text toolbar
+  // ----------------------------------------------------------------- //
+  var rt = document.getElementById("rt");
+  try { document.execCommand("styleWithCSS", false, false); } catch (e) {}
+
+  function editableAncestor(node) {
+    while (node && node !== document) {
+      if (node.nodeType === 1 && node.isContentEditable && node.closest(".row")) return node;
+      node = node.parentNode;
+    }
+    return null;
+  }
+
+  function showToolbar() {
+    var sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) { rt.style.display = "none"; return; }
+    if (!editableAncestor(sel.anchorNode)) { rt.style.display = "none"; return; }
+    var box = sel.getRangeAt(0).getBoundingClientRect();
+    if (!box.width && !box.height) { rt.style.display = "none"; return; }
+    rt.style.display = "block";
+    rt.style.left = Math.max(4, box.left + window.scrollX) + "px";
+    rt.style.top = Math.max(4, box.top + window.scrollY - 34) + "px";
+  }
+
+  document.addEventListener("selectionchange", showToolbar);
+
+  rt.addEventListener("mousedown", function (e) { e.preventDefault(); });
+  rt.addEventListener("click", function (e) {
+    var btn = e.target.closest("button");
+    if (!btn) return;
+    document.execCommand(btn.dataset.cmd, false, null);
+    commit(true);
+  });
+
+  page.addEventListener("keydown", function (e) {
+    if (!(e.ctrlKey || e.metaKey)) return;
+    var cmd = { b: "bold", i: "italic", u: "underline" }[e.key.toLowerCase()];
+    if (!cmd) return;
+    e.preventDefault();
+    document.execCommand(cmd, false, null);
+    commit(true);
+  });
+
+  var timer = null;
+  function commit(now) {
+    syncHeight();
+    if (timer) clearTimeout(timer);
+    if (now) { setValue(collect()); return; }
+    // Debounced so every keystroke does not trigger a Streamlit rerun.
+    timer = setTimeout(function () { setValue(collect()); }, 600);
+  }
+
+  page.addEventListener("input", function () { commit(); });
+  page.addEventListener("focusout", function () { commit(true); });
+
+  document.getElementById("addline").addEventListener("click", function () {
+    var fresh = makeRow({ kind: "text", text: "", value: "" });
+    page.appendChild(fresh);
+    focusEnd(editableOf(fresh));
+    commit(true);
+  });
+
+  // ----------------------------------------------------------------- //
+  // Streamlit render events
+  // ----------------------------------------------------------------- //
+  window.addEventListener("message", function (event) {
+    if (!event.data || event.data.type !== "streamlit:render") return;
+    var args = event.data.args || {};
+    // Rebuild only when the source report actually changed. Reruns caused by
+    // our own setComponentValue carry the same nonce and must be ignored, or
+    // the caret would jump on every keystroke.
+    if (args.nonce === currentNonce) { syncHeight(); return; }
+    currentNonce = args.nonce;
+    render(args.blocks || []);
+  });
+
+  post("streamlit:componentReady", { apiVersion: 1 });
+  syncHeight();
+  window.addEventListener("resize", syncHeight);
+  // Content-driven, so a detached iframe stops posting instead of spamming the
+  // parent with messages from an instance Streamlit no longer knows about.
+  if (window.ResizeObserver) {
+    new ResizeObserver(syncHeight).observe(document.getElementById("root"));
+  }
+})();
+</script>
+</body>
+</html>

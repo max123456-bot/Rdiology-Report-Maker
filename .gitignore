@@ -1,0 +1,26 @@
+# Secrets. The API key lives here and must never reach a repository.
+.streamlit/secrets.toml
+*.env
+.env
+
+# Generated output
+output/
+*.docx
+!samples/*.docx
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.model_cache.json
+
+# Template backups
+templates/_backups/
+
+# Local database files
+data/
+*.db
+*.db-wal
+*.db-shm
+templates/_events.jsonl
