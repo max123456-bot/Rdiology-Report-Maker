@@ -19,7 +19,7 @@ import zipfile
 
 from docx import Document
 
-import hc_format
+
 import readers
 import storage
 import templates

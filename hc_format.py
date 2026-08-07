@@ -428,6 +428,18 @@ def _rgb(hex_colour: str) -> RGBColor:
         return BLACK
 
 
+# XML 1.0 permits tab, newline and carriage return, and nothing else below
+# U+0020. Text copied out of a PACS, a RIS export or a PDF regularly carries
+# stray control bytes, and python-docx refuses the whole document over one of
+# them - so a single invisible character would take the app down mid-clinic.
+_ILLEGAL_XML = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f￾￿]")
+
+
+def sanitise(text: str) -> str:
+    """Strip characters Word cannot store. Removes nothing a reader can see."""
+    return _ILLEGAL_XML.sub("", text or "")
+
+
 def _style_run(
     run,
     *,
@@ -513,7 +525,7 @@ def _add_letterhead(doc: Document, letterhead: dict, template) -> None:
             # explicitly rather than inheriting whatever the body uses.
             p.paragraph_format.line_spacing = 1.0
             _style_run(
-                p.add_run(line),
+                p.add_run(sanitise(line)),
                 bold=bold,
                 font_name=template.font_name,
                 font_size=size,
@@ -577,10 +589,11 @@ def build_docx(
         base_underline = False if force_plain else spec.underline
         parts = spans or [Span(text=text)]
         for span in parts:
-            if span.text == "":
+            clean = sanitise(span.text)
+            if clean == "":
                 continue
             _style_run(
-                p.add_run(span.text),
+                p.add_run(clean),
                 bold=base_bold or span.bold,
                 italic=base_italic or span.italic,
                 underline=base_underline or span.underline,

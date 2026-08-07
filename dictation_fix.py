@@ -41,6 +41,8 @@ _TENS = {
     "twenty": 20, "thirty": 30, "forty": 40, "fourty": 40, "fifty": 50,
     "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
 }
+# "lakh" included because an Indian radiologist dictating a cell count says it.
+_SCALES = {"hundred": 100, "thousand": 1000, "lakh": 100_000}
 
 # How radiologists say units out loud, mapped to how they must be written.
 UNIT_WORDS = {
@@ -53,12 +55,16 @@ UNIT_WORDS = {
     "percent": "%", "per cent": "%", "percentage": "%",
     "hounsfield": "HU", "hounsfield units": "HU",
     "megahertz": "MHz",
-    "week": "weeks", "weeks": "weeks",
-    "year": "years", "years": "years",
 }
 
+# Deliberately NOT units: "week" and "year". Normalising them pluralised
+# "seventy year old male" into "70 years old male", corrupting the grammar of
+# the commonest phrase in a radiology report. The number still converts; the
+# word is left exactly as dictated.
+
 _NUMBER_WORD = "|".join(
-    sorted(list(_ONES) + list(_TENS) + ["hundred", "point", "and"], key=len, reverse=True)
+    sorted(list(_ONES) + list(_TENS) + list(_SCALES) + ["point", "and"],
+           key=len, reverse=True)
 )
 _SPOKEN = re.compile(rf"\b((?:{_NUMBER_WORD})(?:[ -](?:{_NUMBER_WORD}))*)\b", re.I)
 
@@ -79,22 +85,46 @@ def _words_to_number(phrase: str) -> str | None:
         (decimal_tokens if seen_point else whole_tokens).append(token)
 
     def whole(parts: list[str]) -> int | None:
+        """
+        Standard English number grammar only.
+
+        "twenty three" is 23. "two fifty" is NOT 52 - it is how many Indian
+        English speakers say 250, and an additive parser silently turned it into
+        52. A wrong measurement is worse than an unconverted one, so anything
+        that does not follow tens-then-ones is left as words for the radiologist
+        to write themselves.
+        """
         total = current = 0
         matched = False
+        previous: str | None = None
+
         for part in parts:
             if part in _ONES:
+                # A ones-word directly after a tens-word is fine ("twenty three").
+                # A ones-word directly BEFORE a tens-word is ambiguous.
+                if previous in _ONES:
+                    return None  # "two three" - not a number, or a digit string
                 current += _ONES[part]
                 matched = True
             elif part in _TENS:
+                if previous in _ONES:
+                    return None  # "two fifty" - ambiguous, refuse to guess
                 current += _TENS[part]
                 matched = True
-            elif part == "hundred":
+            elif part in _SCALES:
                 if current == 0:
                     current = 1
-                current *= 100
+                scale = _SCALES[part]
+                if scale == 100:
+                    current *= scale
+                else:
+                    total += current * scale
+                    current = 0
                 matched = True
             else:
                 return None
+            previous = part
+
         return (total + current) if matched else None
 
     left = whole(whole_tokens) if whole_tokens else (0 if seen_point else None)
@@ -123,11 +153,26 @@ def spoken_numbers(text: str) -> tuple[str, int]:
     def replace(match: re.Match) -> str:
         nonlocal changes
         phrase = match.group(1)
+
         # A lone "one"/"and"/"point" is almost always ordinary prose.
         if len(re.split(r"[ -]+", phrase.strip())) == 1 and phrase.lower() in (
-            "one", "and", "point", "ten"
+            "one", "and", "point", "ten", "hundred", "thousand", "lakh"
         ):
             return phrase
+
+        # "a hundred percent normal", "a thousand times better" - an article in
+        # front means it is being used as a figure of speech, not a measurement.
+        preceding = text[max(0, match.start() - 3):match.start()].lower()
+        if preceding.endswith(("a ", "an ")):
+            return phrase
+
+        # "one and a half centimetres" - a fraction this parser cannot express.
+        # Converting only the leading word produced "1 a half", so leave it whole
+        # and let the radiologist write the fraction they meant.
+        following = text[match.end():match.end() + 14].lower()
+        if re.match(r"\s*(a\s+)?(half|quarter|third)\b", following):
+            return phrase
+
         value = _words_to_number(phrase)
         if value is None:
             return phrase
@@ -159,8 +204,9 @@ def units(text: str) -> tuple[str, int]:
 
     text = pattern.sub(replace, text)
 
-    # "9.8 by 4.4 cm" -> "9.8 x 4.4 cm", the way it is written in a report.
-    text, n = re.subn(r"(\d(?:\.\d+)?)\s+by\s+(\d)", r"\1 x \2", text, flags=re.I)
+    # "9.8 by 4.4 cm" and "9.8 into 4.4 cm" both mean 9.8 x 4.4. "into" is how
+    # dimensions are usually spoken in India.
+    text, n = re.subn(r"(\d(?:\.\d+)?)\s+(?:by|into)\s+(\d)", r"\1 x \2", text, flags=re.I)
     changes += n
     return text, changes
 
@@ -188,7 +234,11 @@ def near_misses(text: str, vocabulary: list[str], threshold: float = 0.78) -> li
     if not vocabulary:
         return []
 
-    known = {v.strip().lower(): v.strip() for v in vocabulary if v.strip()}
+    known = {
+        str(v).strip().lower(): str(v).strip()
+        for v in vocabulary
+        if isinstance(v, str) and v.strip()
+    }
     if not known:
         return []
 
