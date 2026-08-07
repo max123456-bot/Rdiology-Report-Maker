@@ -363,6 +363,70 @@ class SqlStore:
             if not self.is_postgres:
                 self._conn.commit()
 
+        self._migrate_schema()
+
+    def _columns(self, table: str) -> set[str]:
+        cur = self._conn.cursor()
+        if self.is_postgres:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+                (table,),
+            )
+            return {str(r[0]) for r in cur.fetchall()}
+        cur.execute(f"PRAGMA table_info({table})")
+        return {str(r[1]) for r in cur.fetchall()}
+
+    def _migrate_schema(self) -> None:
+        """
+        Bring an older database up to the current shape.
+
+        CREATE TABLE IF NOT EXISTS does nothing when the table is already there,
+        so a database created before tenancy existed keeps its old columns and
+        every query against `tenant` fails. Databases in use cannot be recreated,
+        so they are rebuilt in place with the existing rows assigned to the
+        default tenant.
+
+        Safe to run on every start: it checks first and does nothing when the
+        schema is already current.
+        """
+        with self._lock:
+            try:
+                columns = self._columns("templates")
+            except Exception:
+                return  # brand new database - _create_schema already made it right
+            if not columns or "tenant" in columns:
+                return
+
+            cur = self._conn.cursor()
+            json_type = "JSONB" if self.is_postgres else "TEXT"
+            try:
+                cur.execute("ALTER TABLE templates RENAME TO templates_pre_tenant")
+                cur.execute(
+                    f"""CREATE TABLE templates (
+                            tenant    TEXT NOT NULL DEFAULT 'default',
+                            name      TEXT NOT NULL,
+                            payload   {json_type} NOT NULL,
+                            version   INTEGER NOT NULL DEFAULT 1,
+                            updated   TEXT NOT NULL,
+                            PRIMARY KEY (tenant, name)
+                        )"""
+                )
+                cur.execute(
+                    "INSERT INTO templates (tenant, name, payload, version, updated) "
+                    "SELECT 'default', name, payload, version, updated FROM templates_pre_tenant"
+                )
+                # Kept, not dropped: if anything about this migration was wrong,
+                # the original rows are still there to recover from.
+                if not self.is_postgres:
+                    self._conn.commit()
+            except Exception:
+                if not self.is_postgres:
+                    try:
+                        self._conn.rollback()
+                    except Exception:
+                        pass
+                raise
+
     def _dumps(self, payload: dict) -> str:
         return json.dumps(payload, ensure_ascii=False)
 

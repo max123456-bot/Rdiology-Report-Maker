@@ -153,6 +153,61 @@ def check_isolation(store: storage.Store, label: str) -> None:
     store.delete(fortis, "Dr. Sharad")
 
 
+def check_schema_upgrade() -> None:
+    """A database created before tenancy must upgrade itself, losing nothing."""
+    print("\nUpgrading a pre-tenancy database")
+    import json
+    import sqlite3
+
+    workdir = tempfile.mkdtemp(prefix="hcfmt_upgrade_")
+    path = os.path.join(workdir, "old.db")
+    try:
+        # The exact old shape: no tenant column, primary key on name alone.
+        con = sqlite3.connect(path)
+        con.execute("""CREATE TABLE templates (
+            name TEXT PRIMARY KEY, payload TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1, updated TEXT NOT NULL)""")
+        con.execute("""CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, when_ TEXT NOT NULL, kind TEXT NOT NULL,
+            subject TEXT NOT NULL, detail TEXT, user_ TEXT)""")
+        original = templates.copy_of(templates.HC_FORMAT, "Dr. Old", doctor="Before tenancy")
+        original = templates.remember_dictation_fix(original, "colic list", "cholelithiasis")
+        con.execute("INSERT INTO templates VALUES (?,?,?,?)",
+                    ("Dr. Old", json.dumps(templates.to_dict(original)), 7, "2026-01-01"))
+        con.commit()
+        con.close()
+
+        store = storage.SqlStore(f"sqlite:///{path}")
+        rows = store.load_all(storage.DEFAULT_TENANT)
+        check("Dr. Old" in rows, "the existing template survived the upgrade")
+        if "Dr. Old" in rows:
+            restored = templates.from_dict(rows["Dr. Old"])
+            check(restored.doctor == "Before tenancy", "its contents are intact")
+            check(bool(restored.vocabulary), "its learned vocabulary is intact")
+        check(store.fingerprint(storage.DEFAULT_TENANT, "Dr. Old") == "7",
+              "the version counter was carried over, so locking still works")
+
+        # The whole point: two clinics can now share a name.
+        store.save("other-clinic", "Dr. Old", {"name": "Dr. Old", "doctor": "Someone else"})
+        check(store.load_all(storage.DEFAULT_TENANT)["Dr. Old"]["doctor"] == "Before tenancy",
+              "adding another clinic did not touch the migrated rows")
+
+        # The original rows are kept, so a bad migration is recoverable.
+        con = sqlite3.connect(path)
+        kept = con.execute("SELECT count(*) FROM templates_pre_tenant").fetchone()[0]
+        con.close()
+        check(kept == 1, "the pre-migration rows are kept for recovery")
+
+        # Opening again must not migrate a second time.
+        store.close()
+        again = storage.SqlStore(f"sqlite:///{path}")
+        check(len(again.load_all(storage.DEFAULT_TENANT)) == 1,
+              "re-opening does not re-run the migration")
+        again.close()
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def check_migration() -> None:
     print("\nMigration between stores")
     workdir = tempfile.mkdtemp(prefix="hcfmt_migrate_")
@@ -213,6 +268,7 @@ def main() -> int:
         else:
             print("\nPostgres — skipped (set TEST_POSTGRES_URL to a throwaway database to run it)")
 
+        check_schema_upgrade()
         check_migration()
         check_fallback()
     finally:
