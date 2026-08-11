@@ -33,6 +33,10 @@ pytesseract>=0.3.10
 pyyaml>=6.0
 pydantic>=2.0
 
+# PHI encryption at rest (crypto.py) and nothing else - only loaded when a
+# PHI_KEY is configured.
+cryptography>=42.0
+
 # The service layer: uvicorn api:app - the engine over REST for RIS
 # integration. The Streamlit UI does not use these.
 fastapi>=0.110

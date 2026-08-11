@@ -129,3 +129,73 @@ def sign_out_control() -> None:
                              help="Require the access code again on this device."):
             st.session_state.pop("access_ok", None)
             st.rerun()
+
+
+# --------------------------------------------------------------------------- #
+# Roles - who may do what
+# --------------------------------------------------------------------------- #
+
+# The full role set. A solo clinic never configures any of this and gets
+# "attending" - full capability, exactly the behaviour before roles existed.
+ROLES = ("attending", "resident", "transcriptionist", "admin", "auditor")
+
+# What each role may do. Signing is the legally meaningful act, so it is the
+# tightest: an attending radiologist only. Residents draft; transcriptionists
+# type; auditors read.
+_CAPABILITIES = {
+    "attending":       {"draft", "sign", "deliver", "alert", "manage_templates"},
+    "resident":        {"draft"},
+    "transcriptionist": {"draft"},
+    "admin":           {"draft", "deliver", "manage_templates"},
+    "auditor":         set(),
+}
+
+
+def current_role() -> str:
+    """
+    The signed-in user's role.
+
+    Configured with a ROLE_MAP secret: "a@x.com:attending, b@x.com:resident".
+    ROLE_DEFAULT sets everyone else (default: attending, so a clinic that
+    never heard of roles keeps working exactly as before). With no sign-in
+    there is no identity to restrict, so the default applies.
+    """
+    fallback = (_configured("ROLE_DEFAULT") or "attending").strip().lower()
+    if fallback not in ROLES:
+        fallback = "attending"
+
+    email = storage.current_user().strip().lower()
+    raw_map = _configured("ROLE_MAP")
+    if not email or not raw_map:
+        return fallback
+    for entry in raw_map.split(","):
+        if ":" not in entry:
+            continue
+        who, _, role = entry.strip().partition(":")
+        if who.strip().lower() == email and role.strip().lower() in ROLES:
+            return role.strip().lower()
+    return fallback
+
+
+def can(action: str, role: str | None = None) -> bool:
+    """May this role perform this action? Unknown roles can do nothing."""
+    return action in _CAPABILITIES.get(role or current_role(), set())
+
+
+class PermissionDenied(RuntimeError):
+    """The role is not allowed to perform this action."""
+
+    def __init__(self, action: str, role: str):
+        super().__init__(
+            f"A {role} cannot {action}. Signing needs an attending radiologist - "
+            "that is the legally meaningful act, and the log must show who did it."
+        )
+        self.action = action
+        self.role = role
+
+
+def require(action: str, role: str | None = None) -> None:
+    """Raise PermissionDenied unless the role may perform the action."""
+    resolved = role or current_role()
+    if not can(action, resolved):
+        raise PermissionDenied(action, resolved)

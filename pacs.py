@@ -242,6 +242,166 @@ def find_studies(host: str, port: int, called_aet: str = "ANY-SCP",
     return results
 
 
+def mwl_query(host: str, port: int, called_aet: str = "ANY-SCP",
+              calling_aet: str = DEFAULT_AET, modality: str = "",
+              date: str = "") -> list[dict]:
+    """
+    Modality Worklist query: what is SCHEDULED, so the radiologist picks the
+    patient instead of typing demographics. `date` is DICOM YYYYMMDD (empty =
+    the server's default, usually today). Raises RuntimeError with a plain
+    reason on failure.
+    """
+    if not PYNETDICOM_OK:
+        raise RuntimeError("pynetdicom is not installed: pip install pynetdicom")
+    from pydicom.dataset import Dataset
+    from pynetdicom import AE
+    from pynetdicom.sop_class import ModalityWorklistInformationFind
+
+    ae = AE(ae_title=calling_aet)
+    ae.add_requested_context(ModalityWorklistInformationFind)
+    ae.acse_timeout = ae.dimse_timeout = ae.network_timeout = TIMEOUT
+
+    step = Dataset()
+    step.Modality = modality or ""
+    step.ScheduledProcedureStepStartDate = date or ""
+    step.ScheduledProcedureStepDescription = ""
+    query = Dataset()
+    query.PatientName = ""
+    query.PatientID = ""
+    query.PatientSex = ""
+    query.PatientBirthDate = ""
+    query.AccessionNumber = ""
+    query.ReferringPhysicianName = ""
+    query.RequestedProcedureDescription = ""
+    query.ScheduledProcedureStepSequence = [step]
+
+    try:
+        assoc = ae.associate(host, int(port), ae_title=called_aet)
+    except Exception as exc:
+        raise RuntimeError(f"Could not associate with the worklist SCP: {exc}") from exc
+    if not assoc.is_established:
+        raise RuntimeError("The worklist SCP rejected the association - check "
+                           "host, port and AE titles.")
+    results: list[dict] = []
+    try:
+        for status, identifier in assoc.send_c_find(
+            query, ModalityWorklistInformationFind
+        ):
+            if status is None:
+                raise RuntimeError("The connection dropped mid-query.")
+            if status.Status in (0xFF00, 0xFF01) and identifier is not None:
+                sps = (identifier.ScheduledProcedureStepSequence[0]
+                       if getattr(identifier, "ScheduledProcedureStepSequence", None)
+                       else None)
+                results.append({
+                    "patient": str(getattr(identifier, "PatientName", "")).replace("^", " "),
+                    "patient_id": str(getattr(identifier, "PatientID", "")),
+                    "sex": str(getattr(identifier, "PatientSex", "")),
+                    "birth_date": str(getattr(identifier, "PatientBirthDate", "")),
+                    "accession": str(getattr(identifier, "AccessionNumber", "")),
+                    "referrer": str(getattr(identifier, "ReferringPhysicianName", "")).replace("^", " "),
+                    "procedure": str(getattr(identifier, "RequestedProcedureDescription", "")),
+                    "modality": str(getattr(sps, "Modality", "")) if sps else "",
+                    "scheduled": str(getattr(sps, "ScheduledProcedureStepStartDate", "")) if sps else "",
+                })
+    finally:
+        assoc.release()
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# DICOMweb - QIDO-RS / WADO-RS over plain HTTPS
+# --------------------------------------------------------------------------- #
+
+# DICOM tag keywords in QIDO JSON responses.
+_Q = {
+    "patient": "00100010", "patient_id": "00100020", "sex": "00100040",
+    "study_date": "00080020", "description": "00081030",
+    "modalities": "00080061", "study_uid": "0020000D",
+}
+
+
+def dicomweb_config() -> dict | None:
+    """DICOMWEB_URL secret - e.g. an Orthanc's /dicom-web root."""
+    url = _secret("DICOMWEB_URL").rstrip("/")
+    if not url:
+        return None
+    return {
+        "url": url,
+        "username": _secret("DICOMWEB_USERNAME") or _secret("ORTHANC_USERNAME"),
+        "password": _secret("DICOMWEB_PASSWORD") or _secret("ORTHANC_PASSWORD"),
+    }
+
+
+def _dicomweb_request(path: str, accept: str) -> bytes:
+    config = dicomweb_config()
+    if not config:
+        raise RuntimeError("DICOMweb is not configured - set DICOMWEB_URL in secrets.")
+    request = urllib.request.Request(config["url"] + path)
+    request.add_header("Accept", accept)
+    if config["username"]:
+        credentials = f"{config['username']}:{config['password']}".encode()
+        request.add_header("Authorization",
+                           f"Basic {base64.b64encode(credentials).decode()}")
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"DICOMweb refused {path}: HTTP {exc.code}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Could not reach DICOMweb at {config['url']}: {exc}") from exc
+
+
+def _qido_value(entry: dict, tag: str) -> str:
+    values = (entry.get(tag) or {}).get("Value") or []
+    if not values:
+        return ""
+    first = values[0]
+    if isinstance(first, dict):  # PN values: {"Alphabetic": "DEVI^SUNITA"}
+        return str(first.get("Alphabetic", "")).replace("^", " ")
+    return str(first)
+
+
+def qido_studies(limit: int = 15, patient_name: str = "") -> list[dict]:
+    """QIDO-RS study search - the standards-based way to list studies."""
+    path = f"/studies?limit={int(limit)}&includefield=00081030"
+    if patient_name:
+        path += "&PatientName=" + urllib.parse.quote(patient_name)
+    body = _dicomweb_request(path, "application/dicom+json")
+    entries = json.loads(body.decode("utf-8", "replace") or "[]")
+    return [
+        {name: _qido_value(entry, tag) for name, tag in _Q.items()}
+        for entry in entries if isinstance(entry, dict)
+    ]
+
+
+def wado_instance(study_uid: str, series_uid: str, instance_uid: str) -> bytes:
+    """
+    WADO-RS: one instance's .dcm bytes. The response is multipart/related;
+    the DICOM part is extracted here so callers just get the file.
+    """
+    path = (f"/studies/{urllib.parse.quote(study_uid)}"
+            f"/series/{urllib.parse.quote(series_uid)}"
+            f"/instances/{urllib.parse.quote(instance_uid)}")
+    body = _dicomweb_request(
+        path, 'multipart/related; type="application/dicom"')
+    return _first_multipart_part(body)
+
+
+def _first_multipart_part(body: bytes) -> bytes:
+    """The payload of the first part of a multipart/related response."""
+    if not body.startswith(b"--"):
+        return body  # some servers answer single-part; take it as-is
+    newline = body.find(b"\r\n")
+    boundary = body[:newline]
+    part = body.split(boundary)[1]
+    header_end = part.find(b"\r\n\r\n")
+    if header_end == -1:
+        raise RuntimeError("Malformed multipart response from WADO-RS.")
+    payload = part[header_end + 4:]
+    return payload.rstrip(b"\r\n-")
+
+
 # --------------------------------------------------------------------------- #
 # pynetdicom - SCP side (modalities push to us)
 # --------------------------------------------------------------------------- #

@@ -86,16 +86,40 @@ def _configured_name() -> str:
     return os.environ.get("AI_PROVIDER", "gemini").strip().lower() or "gemini"
 
 
-def available() -> list[str]:
+def _ollama_provider() -> Provider | None:
+    """The air-gapped path, when OLLAMA_URL is configured. See ollama.py."""
+    import ollama
+
+    if ollama.config() is None:
+        return None
+    return Provider(
+        name="ollama",
+        label="Local model (Ollama)",
+        # Vision and speech stay None on purpose - the app hides those
+        # features instead of pretending a text model can see or hear.
+        draft=ollama.draft_with_questions,
+        impression=ollama.draft_impression,
+        extras={"second_opinion": ollama.second_opinion},
+    )
+
+
+def _ensure_builtins() -> None:
     if "gemini" not in _registry:
         register(_gemini())
+    if "ollama" not in _registry:
+        local = _ollama_provider()
+        if local is not None:
+            register(local)
+
+
+def available() -> list[str]:
+    _ensure_builtins()
     return sorted(_registry)
 
 
 def active() -> Provider:
     """The provider the app should use right now."""
-    if "gemini" not in _registry:
-        register(_gemini())
+    _ensure_builtins()
     name = _configured_name()
     if name in _registry:
         return _registry[name]

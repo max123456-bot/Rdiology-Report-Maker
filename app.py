@@ -22,6 +22,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import access
+import deid
 import dicom_meta
 import dictation_fix
 import guidelines
@@ -1144,9 +1145,23 @@ with tab_single:
                     try:
                         import ai_parser as _ai
 
+                        id_fields = records.fields_from_blocks(blocks)
+                        shielded = deid.for_cloud(
+                            raw_text,
+                            [id_fields["patient"], id_fields["referrer"]],
+                        )
+                        if shielded.changed:
+                            st.caption(f"De-identified before sending: "
+                                       f"{len(shielded.mapping)} identifier(s) "
+                                       "replaced with placeholders.")
                         with st.spinner("Reading the report..."):
-                            opinion = _ai.second_opinion(raw_text, api_key,
+                            opinion = _ai.second_opinion(shielded.text, api_key,
                                                          model_choice)
+                        for issue in opinion["issues"]:
+                            issue["detail"] = deid.reidentify(issue["detail"],
+                                                              shielded.mapping)
+                            issue["title"] = deid.reidentify(issue["title"],
+                                                             shielded.mapping)
                         if not opinion["issues"]:
                             st.success("AI second opinion: nothing further to flag.")
                         for issue in opinion["issues"]:
@@ -1347,18 +1362,38 @@ with tab_single:
                         record_map[content_key] = rec["id"]
                         st.rerun()
                 with col_sign:
-                    sign_help = ("Marks the report signed by you and stores it. "
-                                 "Signing unlocks delivery, HL7/FHIR export and alerts.")
-                    if clinical.critical:
-                        sign_help += (" There are critical check findings above - "
-                                      "signing is still your call.")
-                    if st.button(":material/draw: Sign & save", type="primary",
-                                 width="stretch", help=sign_help):
-                        rec = records.new_record(raw_text, blocks, source="paste")
-                        records.sign(rec, user=storage.current_user())
-                        records.save(rec)
-                        record_map[content_key] = rec["id"]
-                        st.rerun()
+                    signer_role = access.current_role()
+                    if not access.can("sign", signer_role):
+                        st.button(":material/draw: Sign & save", disabled=True,
+                                  width="stretch",
+                                  help=f"Signing needs an attending radiologist - "
+                                       f"you are signed in as “{signer_role}”. "
+                                       "Save to worklist instead; an attending "
+                                       "signs from there.")
+                    else:
+                        justification = ""
+                        if clinical.critical:
+                            justification = st.text_input(
+                                "Justification (required - the checks above "
+                                "found something critical)",
+                                key="sign_justification",
+                                placeholder="Why it is safe to sign despite the flag",
+                            )
+                        sign_help = ("Marks the report signed by you and stores it. "
+                                     "Signing unlocks delivery, HL7/FHIR export "
+                                     "and alerts.")
+                        if st.button(":material/draw: Sign & save", type="primary",
+                                     width="stretch", help=sign_help,
+                                     disabled=bool(clinical.critical
+                                                   and not justification.strip())):
+                            rec = records.new_record(raw_text, blocks, source="paste")
+                            records.sign(rec, user=storage.current_user(),
+                                         role=signer_role,
+                                         critical=bool(clinical.critical),
+                                         justification=justification)
+                            records.save(rec)
+                            record_map[content_key] = rec["id"]
+                            st.rerun()
             else:
                 status_line = (
                     f"{URGENCY_BADGE.get(stored.get('urgency'), '')} · "
@@ -1372,16 +1407,35 @@ with tab_single:
                 act_col, hl7_col, fhir_col = st.columns(3)
                 with act_col:
                     if stored.get("status") == "draft":
-                        if st.button(":material/draw: Sign report", type="primary",
-                                     width="stretch"):
-                            records.sign(stored, user=storage.current_user())
-                            records.save(stored)
-                            st.rerun()
+                        stored_role = access.current_role()
+                        if not access.can("sign", stored_role):
+                            st.button(":material/draw: Sign report", disabled=True,
+                                      width="stretch",
+                                      help=f"Signing needs an attending "
+                                           f"radiologist - you are “{stored_role}”.")
+                        else:
+                            stored_just = ""
+                            if clinical.critical:
+                                stored_just = st.text_input(
+                                    "Justification (critical flag)",
+                                    key="stored_sign_justification")
+                            if st.button(":material/draw: Sign report",
+                                         type="primary", width="stretch",
+                                         disabled=bool(clinical.critical
+                                                       and not stored_just.strip())):
+                                records.sign(stored, user=storage.current_user(),
+                                             role=stored_role,
+                                             critical=bool(clinical.critical),
+                                             justification=stored_just)
+                                records.save(stored)
+                                st.rerun()
                     elif stored.get("status") == "signed":
-                        if st.button(":material/local_shipping: Mark delivered",
-                                     width="stretch",
-                                     help="Records that the report went out (with the "
-                                          ".docx download as the channel)."):
+                        if not access.can("deliver"):
+                            st.caption("Delivery needs an attending or admin role.")
+                        elif st.button(":material/local_shipping: Mark delivered",
+                                       width="stretch",
+                                       help="Records that the report went out (with "
+                                            "the .docx download as the channel)."):
                             records.deliver(stored, user=storage.current_user(),
                                             via="download")
                             records.save(stored)
@@ -1537,13 +1591,32 @@ with tab_worklist:
                 with b1:
                     if rec.get("status") == "draft":
                         if st.button("Sign", key=f"wl_sign_{rec['id']}",
-                                     width="stretch"):
-                            records.sign(rec, user=storage.current_user())
-                            records.save(rec)
-                            st.rerun()
+                                     width="stretch",
+                                     disabled=not access.can("sign"),
+                                     help=None if access.can("sign") else
+                                     "Signing needs an attending radiologist."):
+                            parsed_rec = parse_report(rec.get("report_text") or "")
+                            has_critical = bool(
+                                parsed_rec.blocks
+                                and validate.validate(parsed_rec.blocks).critical
+                            )
+                            if has_critical:
+                                st.warning(
+                                    "The checks flag something critical in this "
+                                    "report. Open it in the Report tab and sign "
+                                    "there with a written justification."
+                                )
+                            else:
+                                try:
+                                    records.sign(rec, user=storage.current_user())
+                                    records.save(rec)
+                                    st.rerun()
+                                except (access.PermissionDenied, ValueError) as exc:
+                                    st.error(str(exc))
                     elif rec.get("status") == "signed":
                         if st.button("Mark delivered", key=f"wl_deliver_{rec['id']}",
-                                     width="stretch"):
+                                     width="stretch",
+                                     disabled=not access.can("deliver")):
                             records.deliver(rec, user=storage.current_user(),
                                             via="worklist")
                             records.save(rec)

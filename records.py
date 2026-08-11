@@ -229,20 +229,60 @@ def _stamp(record: dict, what: str, user: str) -> None:
                                            "user": user})
 
 
-def sign(record: dict, user: str = "") -> dict:
-    """draft -> signed. Refuses to sign twice or to sign a delivered report."""
+def sign(record: dict, user: str = "", role: str | None = None,
+         critical: bool = False, justification: str = "") -> dict:
+    """
+    draft -> signed. Refuses to sign twice or to sign a delivered report.
+
+    Role-gated: signing is the legally meaningful act, so only an attending
+    radiologist's role may perform it (access.require raises otherwise; a
+    deployment with no roles configured defaults everyone to attending, which
+    is the pre-RBAC behaviour).
+
+    Hard-stop: when the safety checks found something critical, signing
+    demands a written justification - it goes on the record's trail and into
+    the audit log, so overriding a safety flag is always attributable.
+    """
+    import access
+
+    access.require("sign", role)
     if record.get("status") != "draft":
         raise ValueError(f"Only a draft can be signed - this report is "
                          f"{record.get('status')}.")
+    if critical and not justification.strip():
+        raise ValueError(
+            "The safety checks flagged something critical. Signing past a "
+            "critical flag needs a written justification - it is recorded, "
+            "not forbidden."
+        )
     record["status"] = "signed"
     record["signed_by"] = user
     record["signed_at"] = _now()
-    _stamp(record, "signed", user)
+    if justification.strip():
+        record["sign_justification"] = justification.strip()
+        _stamp(record, f"signed past critical flag: {justification.strip()[:160]}",
+               user)
+        storage.log("report.sign_override", record.get("study") or record.get("id", ""),
+                    detail=justification.strip()[:400], user=user)
+    else:
+        _stamp(record, "signed", user)
+
+    # Non-repudiation: a keyed signature over the exact signed text. With no
+    # ATTEST_KEY this is empty rather than fake - a plain hash proves
+    # integrity (the attestation chain does that) but not WHO, so only a
+    # secret key makes this a signature worth the name.
+    import verify
+
+    record["signature"] = verify.hmac_signature(record.get("report_text", ""))
     return record
 
 
-def deliver(record: dict, user: str = "", via: str = "download") -> dict:
+def deliver(record: dict, user: str = "", via: str = "download",
+            role: str | None = None) -> dict:
     """signed -> delivered. A draft cannot be delivered - it was never signed."""
+    import access
+
+    access.require("deliver", role)
     if record.get("status") == "draft":
         raise ValueError("Sign the report before delivering it.")
     record["status"] = "delivered"

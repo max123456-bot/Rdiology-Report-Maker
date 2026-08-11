@@ -227,6 +227,48 @@ def auto_reconcile(target_text: str, plan: list[Insertion]) -> tuple[str, list[I
 # --------------------------------------------------------------------------- #
 
 
+def _attest_key() -> bytes:
+    """ATTEST_KEY from secrets/environment, or b'' when unset."""
+    import os
+
+    value = ""
+    try:
+        import streamlit as st
+
+        if "ATTEST_KEY" in st.secrets:
+            value = str(st.secrets["ATTEST_KEY"]).strip()
+    except Exception:
+        pass
+    value = value or os.environ.get("ATTEST_KEY", "").strip()
+    return value.encode("utf-8")
+
+
+def hmac_signature(text: str) -> str:
+    """
+    HMAC-SHA256 over the text with ATTEST_KEY - non-repudiation for a signed
+    report: only a holder of the key can produce it, so a matching signature
+    proves both that the text is untampered AND that this system signed it.
+    Returns "" when no key is configured - honest absence, never a fake.
+    """
+    import hashlib
+    import hmac as _hmac
+
+    key = _attest_key()
+    if not key:
+        return ""
+    return _hmac.new(key, (text or "").encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def verify_signature(text: str, signature: str) -> bool:
+    """Constant-time check of a report's keyed signature."""
+    import hmac as _hmac
+
+    expected = hmac_signature(text)
+    if not expected or not signature:
+        return False
+    return _hmac.compare_digest(expected, signature)
+
+
 def attestation(raw_text: str, docx_bytes: bytes, ok: bool,
                 previous_chain: str = "") -> dict:
     """
@@ -244,13 +286,20 @@ def attestation(raw_text: str, docx_bytes: bytes, ok: bool,
     chain = hashlib.sha256(
         f"{previous_chain}|{source_sha}|{output_sha}|{verdict}".encode("ascii")
     ).hexdigest()
-    return {
+    record = {
         "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source_sha256": source_sha,
         "output_sha256": output_sha,
         "verdict": verdict,
         "chain": chain,
     }
+    # With ATTEST_KEY configured the chain itself is HMAC-signed, upgrading
+    # tamper-EVIDENT (anyone can recompute a plain hash chain over altered
+    # data) to tamper-PROOF against anyone who does not hold the key.
+    signed = hmac_signature(chain)
+    if signed:
+        record["signature"] = signed
+    return record
 
 
 def record_attestation(raw_text: str, docx_bytes: bytes, ok: bool,

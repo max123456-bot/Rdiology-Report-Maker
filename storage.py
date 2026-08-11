@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
 
+import crypto  # PHI field encryption; a no-op until PHI_KEY is configured
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 # A database that does not answer must never hold up a clinic. Fail in seconds
 # and fall back to files, rather than hanging the app.
@@ -296,7 +298,8 @@ class FileStore:
             target = self._report_path(tenant, record["id"])
             tmp = target + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(record, fh, indent=2, ensure_ascii=False)
+                json.dump(crypto.encrypt_record(record), fh, indent=2,
+                          ensure_ascii=False)
             os.replace(tmp, target)
 
     def get_report(self, tenant: str, report_id: str) -> dict | None:
@@ -306,12 +309,14 @@ class FileStore:
         try:
             with open(path, encoding="utf-8") as fh:
                 payload = json.load(fh)
-            return payload if isinstance(payload, dict) else None
+            return crypto.decrypt_record(payload) if isinstance(payload, dict) else None
         except Exception:
             return None
 
     def list_reports(self, tenant: str, status: str | None = None,
                      patient_key: str | None = None, limit: int = 200) -> list[dict]:
+        if patient_key:
+            patient_key = crypto.protect_key(patient_key)
         folder = self._reports_dir(tenant)
         if not os.path.isdir(folder):
             return []
@@ -330,7 +335,7 @@ class FileStore:
                 continue
             if patient_key and payload.get("patient_key") != patient_key:
                 continue
-            rows.append(payload)
+            rows.append(crypto.decrypt_record(payload))
         rows.sort(key=lambda r: str(r.get("updated") or r.get("created") or ""), reverse=True)
         return rows[:limit]
 
@@ -678,6 +683,7 @@ class SqlStore:
         status = str(record.get("status") or "draft")
         urgency = str(record.get("urgency") or "routine")
         patient_key = str(record.get("patient_key") or "")
+        record = crypto.encrypt_record(record)
 
         def go(cur):
             cur.execute(
@@ -715,7 +721,7 @@ class SqlStore:
             if not row:
                 return None
             try:
-                return self._loads(row[0])
+                return crypto.decrypt_record(self._loads(row[0]))
             except Exception:
                 return None
 
@@ -730,7 +736,7 @@ class SqlStore:
             params.append(status)
         if patient_key:
             query += f" AND patient_key = {self._ph}"
-            params.append(patient_key)
+            params.append(crypto.protect_key(patient_key))
         query += f" ORDER BY updated DESC LIMIT {self._ph}"
         params.append(int(limit))
 
@@ -739,7 +745,7 @@ class SqlStore:
             rows: list[dict] = []
             for (payload,) in cur.fetchall():
                 try:
-                    rows.append(self._loads(payload))
+                    rows.append(crypto.decrypt_record(self._loads(payload)))
                 except Exception:
                     continue
             return rows
