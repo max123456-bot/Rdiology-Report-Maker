@@ -345,8 +345,20 @@ cat_round = templates.from_dict(templates.to_dict(cat_tpl))
 check(cat_round.category == "CT" and cat_round.created_by == "dr.s@clinic.in"
       and cat_round.created_at == cat_tpl.created_at,
       "category and creation details survive the round trip")
-bad = templates.from_dict({**templates.to_dict(cat_tpl), "category": "Astrology"})
-check(bad.category == "General", "an unknown category falls back to General")
+custom = templates.from_dict({**templates.to_dict(cat_tpl),
+                              "category": "Cardiac CT"})
+check(custom.category == "Cardiac CT",
+      "a doctor's own category survives - the built-ins are suggestions")
+junk = templates.from_dict({**templates.to_dict(cat_tpl),
+                            "category": "  <<>>!! "})
+check(junk.category == "General", "junk-only category falls back to General")
+check(templates.clean_category("Interventional") == "Interventional"
+      and templates.clean_category("") == "General",
+      "clean_category keeps sane names and rejects emptiness")
+pool_cats = templates.known_categories(
+    {"a": custom, "b": templates.HC_FORMAT})
+check("Cardiac CT" in pool_cats and "CT" in pool_cats,
+      "known_categories lists built-ins plus customs in use")
 check(templates.macro_trigger("Dr. S — CT Brain") == ".drsctbrain",
       "the macro trigger derives from the name")
 

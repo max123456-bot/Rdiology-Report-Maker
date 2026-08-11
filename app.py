@@ -339,6 +339,30 @@ st.sidebar.caption(
     + template_summary(template)
 )
 
+def category_picker(label: str, key: str, current: str = "General") -> str:
+    """
+    The category dropdown, everywhere one is needed: built-in suggestions,
+    every custom category already in use, and an add-your-own entry.
+    """
+    options = templates.known_categories(all_templates)
+    if current and current not in options:
+        options.append(current)
+    options = options + ["➕ Add a new category…"]
+    chosen = st.selectbox(
+        label, options,
+        index=options.index(current) if current in options else 0,
+        key=key,
+        help="Which study family this template is for. Pick one, or add your "
+             "own — a custom category sticks and appears in every picker.",
+    )
+    if chosen.startswith("➕"):
+        return templates.clean_category(st.text_input(
+            "New category name", key=f"{key}_new",
+            placeholder="Interventional, Cardiac CT, Obstetric...",
+        ))
+    return chosen
+
+
 # Delete needs a little more room than the other two or its label wraps.
 new_col, edit_col, del_col = st.sidebar.columns([1, 1, 1.25])
 
@@ -442,10 +466,7 @@ def _dialog_seed_template(report_text: str, corrections: tuple[str, str] | None 
         doctor = st.text_input("Doctor", placeholder="Dr. Sharad Kulkarni",
                                key="seed_doctor")
     with seed_b:
-        seed_category = st.selectbox(
-            "Category", templates.CATEGORIES, key="seed_category",
-            help="Which study family this template is for — MRI, CT, USG...",
-        )
+        seed_category = category_picker("Category", key="seed_category")
         st.caption(f"Created by **{storage.current_user() or doctor or 'you'}**, "
                    "stamped with today's date.")
     notes = st.text_area(
@@ -3321,11 +3342,7 @@ with tab_templates:
                 ait_doctor = st.text_input("Doctor", key="ait_doctor",
                                            placeholder="Dr. Sharma")
             with g3:
-                ait_category = st.selectbox("Category", templates.CATEGORIES,
-                                            key="ait_category",
-                                            help="MRI / CT / USG... — groups "
-                                                 "the pickers and names the "
-                                                 "study family.")
+                ait_category = category_picker("Category", key="ait_category")
             ait_description = st.text_area(
                 "Describe your template",
                 key="ait_description", height=140,
@@ -3394,6 +3411,118 @@ with tab_templates:
                         )
                         st.rerun()
 
+    with st.expander(
+        f":material/folder_managed: Template manager ({len(template_names)})",
+        expanded=False,
+    ):
+        st.caption(
+            "Every template in one place — filter by category, jump to edit, "
+            "duplicate, export as a file, import from one, or delete."
+        )
+        mgr_filter = st.selectbox(
+            "Filter by category",
+            ["All"] + templates.known_categories(all_templates),
+            key="mgr_filter",
+        )
+        shown = [
+            n for n in template_names
+            if mgr_filter == "All"
+            or (all_templates[n].category or "General") == mgr_filter
+        ]
+        if not shown:
+            st.caption("No templates in this category yet.")
+        for name in shown:
+            tpl = all_templates[name]
+            with st.container(border=True):
+                st.markdown(
+                    f"**{name}**"
+                    + (f" · {tpl.doctor}" if tpl.doctor else "")
+                    + f" · [{tpl.category or 'General'}]"
+                    + (" · built-in, read-only" if tpl.builtin else "")
+                )
+                detail_bits = [templates.learning_summary(tpl)]
+                if tpl.macros:
+                    detail_bits.append(
+                        "macros: " + ", ".join(f"`{t}`" for t in tpl.macros))
+                if tpl.created_by or tpl.created_at:
+                    detail_bits.append(
+                        "created"
+                        + (f" by {tpl.created_by}" if tpl.created_by else "")
+                        + (f" on {tpl.created_at[:10]}" if tpl.created_at else ""))
+                st.caption(" · ".join(detail_bits))
+
+                mg1, mg2, mg3, mg4 = st.columns(4)
+                with mg1:
+                    if st.button(":material/edit: Edit", key=f"mgr_edit_{name}",
+                                 width="stretch"):
+                        st.session_state["tpl_edit_pick"] = name
+                        st.rerun()
+                with mg2:
+                    if st.button(":material/content_copy: Duplicate",
+                                 key=f"mgr_dup_{name}", width="stretch"):
+                        candidate = f"{name} (copy)"
+                        counter = 2
+                        while candidate in all_templates:
+                            candidate = f"{name} (copy {counter})"
+                            counter += 1
+                        duplicate = templates.copy_of(tpl, candidate,
+                                                      doctor=tpl.doctor)
+                        duplicate.category = tpl.category
+                        duplicate.created_at = ""  # a copy is a new creation
+                        duplicate.created_by = ""
+                        duplicate = templates.stamp_creation(
+                            duplicate, created_by=storage.current_user())
+                        templates.save(duplicate)
+                        templates_changed()
+                        st.rerun()
+                with mg3:
+                    import json as _json
+
+                    st.download_button(
+                        ":material/download: Export",
+                        data=_json.dumps(templates.to_dict(tpl), indent=2,
+                                         ensure_ascii=False),
+                        file_name=templates.macro_trigger(name)[1:] + ".json",
+                        mime="application/json",
+                        key=f"mgr_exp_{name}", width="stretch",
+                        help="The whole template as a file — voice, macros, "
+                             "formatting. Import it on another install.",
+                    )
+                with mg4:
+                    if st.button(":material/delete: Delete",
+                                 key=f"mgr_del_{name}", width="stretch",
+                                 disabled=tpl.builtin):
+                        _dialog_delete(tpl)
+
+        up = st.file_uploader(
+            "Import a template file (.json exported above)",
+            type=["json"], key="mgr_import",
+        )
+        if up is not None:
+            import hashlib as _hashlib
+            import json as _json
+
+            digest = _hashlib.sha1(up.getvalue()).hexdigest()
+            if st.session_state.get("mgr_imported") != digest:
+                try:
+                    incoming = templates.from_dict(
+                        _json.loads(up.getvalue().decode("utf-8")))
+                    candidate = incoming.name
+                    counter = 2
+                    while candidate in all_templates:
+                        candidate = f"{incoming.name} (imported"\
+                                    + (f" {counter})" if counter > 2 else ")")
+                        counter += 1
+                    incoming.name = candidate
+                    templates.save(incoming)
+                    templates_changed()
+                    st.session_state["mgr_imported"] = digest
+                    st.success(f"Imported as **{candidate}**.")
+                    st.rerun()
+                except Exception as exc:
+                    st.session_state["mgr_imported"] = digest
+                    st.error(f"Could not import: {exc}")
+
     editing_name = st.selectbox(
         "Edit template", template_names, index=template_names.index(picked_template),
         key="tpl_edit_pick",
@@ -3411,15 +3540,8 @@ with tab_templates:
         t_name = st.text_input("Template name", value=editing.name, key="tpl_name")
         t_doctor = st.text_input("Doctor", value=editing.doctor, key="tpl_doctor",
                                  placeholder="Dr. Sharad Kulkarni")
-        t_category = st.selectbox(
-            "Category", templates.CATEGORIES,
-            index=(templates.CATEGORIES.index(editing.category)
-                   if editing.category in templates.CATEGORIES else 0),
-            key="tpl_category",
-            help="Which study family this template is for — MRI, CT, USG... "
-                 "Shown in every picker so a doctor's CT and MRI templates "
-                 "stay tellable apart.",
-        )
+        t_category = category_picker("Category", key="tpl_category",
+                                     current=editing.category or "General")
         if editing.created_at or editing.created_by:
             st.caption("Created"
                        + (f" by **{editing.created_by}**" if editing.created_by else "")

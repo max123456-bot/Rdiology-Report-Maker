@@ -75,10 +75,27 @@ class Correction:
     when: str = ""
 
 
-# What kind of study a template is for. Filters the pickers, groups the
-# Templates tab, and names the study family a doctor built the template for.
+# Built-in category SUGGESTIONS - not a whitelist. A doctor can type their
+# own ("Interventional", "Cardiac CT") and it sticks; clean_category() only
+# rejects emptiness and absurd length.
 CATEGORIES = ("General", "USG", "CT", "MRI", "X-Ray", "Mammography",
               "Doppler", "Fluoroscopy", "Nuclear")
+
+
+def clean_category(value) -> str:
+    """Any sane non-empty name survives; junk falls back to General."""
+    cleaned = re.sub(r"[^\w /&.-]", "", str(value or "")).strip()[:24]
+    return cleaned or "General"
+
+
+def known_categories(all_templates: dict | None = None) -> list[str]:
+    """The built-ins plus every custom category already in use, for pickers."""
+    seen = list(CATEGORIES)
+    for tpl in (all_templates or {}).values():
+        category = getattr(tpl, "category", "") or ""
+        if category and category not in seen:
+            seen.append(category)
+    return seen
 
 
 @dataclass
@@ -313,9 +330,7 @@ def from_dict(data: dict) -> Template:
     return Template(
         name=str(fields.get("name") or "Untitled template").strip() or "Untitled template",
         doctor=str(fields.get("doctor") or "").strip(),
-        category=(str(fields.get("category") or "General").strip()
-                  if str(fields.get("category") or "").strip() in CATEGORIES
-                  else "General"),
+        category=clean_category(fields.get("category")),
         created_by=str(fields.get("created_by") or "").strip(),
         created_at=str(fields.get("created_at") or "").strip(),
         font_name=str(fields.get("font_name") or "Arial").strip() or "Arial",
