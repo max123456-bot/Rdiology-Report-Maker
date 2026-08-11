@@ -3046,6 +3046,14 @@ with tab_draft:
                     "correction can be taught."
                 )
             else:
+                generated_for = st.session_state.get("draft_section", "")
+                if generated_for and generated_for != section:
+                    st.warning(
+                        f"This draft was generated for **{generated_for.split(' - ')[0]}** — "
+                        f"you have now selected **{section.split(' - ')[0]}**. Press "
+                        "*Write in this doctor's style* again to regenerate.",
+                        icon=":material/sync_problem:",
+                    )
                 applied_bits = []
                 if template.preferences:
                     applied_bits.append(f"{len(template.preferences)} learned rule(s)")

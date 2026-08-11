@@ -135,6 +135,36 @@ def build_draft_prompt(
         parts.append("\nAnswers this radiologist has already given - do not ask these again:")
         parts.extend(f"- {q} -> {a}" for q, a in standing.items())
 
+    # The scope must be an ORDER, not a parenthetical label - given only the
+    # label, a model handed three lines of shorthand happily returns an
+    # impression when the whole report was asked for.
+    scope = (section or "").lower()
+    if "whole report" in scope:
+        parts.append(
+            "\nSCOPE - THE WHOLE REPORT. Produce a complete structured report:\n"
+            "- a study title line (infer the study from the notes, e.g. USG ABDOMEN REPORT)\n"
+            "- FINDINGS: with every fact from the notes stated organ by organ\n"
+            "- IMPRESSION: summarising the abnormal findings\n"
+            "Never return an impression alone - the findings section is mandatory."
+        )
+    elif "findings" in scope:
+        parts.append(
+            "\nSCOPE - FINDINGS ONLY. Produce only the FINDINGS section, organ "
+            "by organ. No title, no impression."
+        )
+    elif "impression" in scope:
+        parts.append(
+            "\nSCOPE - IMPRESSION ONLY. Produce only the IMPRESSION section: "
+            "2-4 concise points. No findings section."
+        )
+    elif "shorthand" in scope:
+        parts.append(
+            "\nSCOPE - SHORTHAND EXPANSION ONLY. Expand abbreviations and "
+            "shorthand into full words and nothing else. Keep the author's "
+            "wording, line order and structure exactly as written; do not "
+            "restyle, do not reorganise, do not add headings that are not there."
+        )
+
     parts.append(
         f"\n--- ROUGH NOTES TO REWRITE ({section}) ---\n{raw_notes.strip()}"
         f"\n\n--- {doctor.upper()}'S VERSION ---"

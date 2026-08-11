@@ -372,6 +372,22 @@ with mock.patch("time.sleep"):
     except RuntimeError:
         check(exhausted.calls == 3, f"retries stop at the cap ({exhausted.calls} calls)")
 
+# The rewrite scope must be an order, not a label - given only the label, a
+# model handed shorthand returns an impression when the whole report was
+# asked for. (Found live, 2026-08-11.)
+_tpl = templates.HC_FORMAT
+scope_prompt = ai_parser.build_draft_prompt(_tpl, "liver 14.2cm normal",
+                                            "the whole report")
+check("Never return an impression alone" in scope_prompt
+      and "FINDINGS:" in scope_prompt,
+      "the whole-report scope demands a findings section explicitly")
+scope_prompt = ai_parser.build_draft_prompt(_tpl, "notes", "the IMPRESSION only")
+check("IMPRESSION ONLY" in scope_prompt and "No findings section" in scope_prompt,
+      "the impression scope forbids a findings section")
+scope_prompt = ai_parser.build_draft_prompt(
+    _tpl, "notes", "shorthand expansion only - expand the abbreviations")
+check("do not restyle" in scope_prompt, "the shorthand scope forbids restyling")
+
 started = time.perf_counter()
 points = ai_parser.draft_impression_from_findings(
     "Liver is enlarged, measures 16.8 cm.\nNo free fluid.\n"
