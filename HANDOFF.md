@@ -125,9 +125,12 @@ still the real fix.
 
 ## Never verified
 
-- **The AI paths have never run against Gemini.** Drafting, transcription, OCR, the
-  proofread, the auto-impression, the scan pre-read — all tested offline against their
-  prompt builders. `live_check.py` exercises them with `GEMINI_API_KEY` set.
+- **Most AI paths have never run against Gemini** — transcription, OCR, the proofread,
+  the auto-impression, the scan pre-read are tested offline against their prompt
+  builders; `live_check.py` exercises them with `GEMINI_API_KEY` set. **Exception,
+  verified live 2026-08-11:** the drafting path (`draft_with_questions`) ran against
+  real Gemini from the Draft tab — shorthand notes came back as a numbered impression
+  with every negation carried and the measurements badge green.
 - **No real audio has been dictated.** The whole speech pipeline is unit-tested only.
 - **No alert has actually been sent.** SMTP and Twilio senders are real code, tested
   against their builders; a live send needs the `ALERT_SMTP_*` / `TWILIO_*` secrets.

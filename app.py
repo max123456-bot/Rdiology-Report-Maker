@@ -2904,10 +2904,32 @@ with tab_draft:
 
         if template.builtin:
             st.info(
-                "You are on the built-in **HC FORMAT**, which holds no doctor's voice and cannot "
-                "learn. Create a template for this doctor with **➕ New** in the sidebar — then "
-                "every correction here is remembered."
+                "You are on the built-in **HC FORMAT**, which holds no doctor's "
+                "voice and cannot learn. Create this doctor's profile right here — "
+                "every correction after that is remembered."
             )
+            prof_name_col, prof_btn_col = st.columns([2, 1])
+            with prof_name_col:
+                new_doctor_name = st.text_input(
+                    "Doctor's name", key="draft_new_doctor",
+                    placeholder="Dr. Sharma",
+                    label_visibility="collapsed",
+                )
+            with prof_btn_col:
+                if st.button(":material/person_add: Create profile & start learning",
+                             type="primary", width="stretch",
+                             disabled=not new_doctor_name.strip()):
+                    profile_name = new_doctor_name.strip()
+                    if profile_name in all_templates:
+                        st.error(f"A template named “{profile_name}” already exists — "
+                                 "pick it in the Report tab instead.")
+                    else:
+                        fresh = templates.copy_of(template, profile_name,
+                                                  doctor=profile_name)
+                        templates.save(fresh)
+                        templates_changed()
+                        st.session_state["tpl_pick"] = profile_name
+                        st.rerun()
         elif not (template.examples or template.preferences or template.corrections):
             st.info(
                 f"Nothing is on file for {doctor_label} yet, so this first draft will stay close "
@@ -2915,19 +2937,29 @@ with tab_draft:
                 "it starts sounding like them."
             )
 
-        # ---------------- Step 1: notes ---------------- #
+        # ------------- Split view: notes in, draft out ------------- #
 
-        section = st.selectbox(
-            "Rewrite",
-            ["the IMPRESSION only", "the FINDINGS only", "the whole report"],
-            help="Narrower is safer. The IMPRESSION is where house style shows most.",
-        )
-        rough = st.text_area(
-            "Rough notes — shorthand is fine",
-            value=st.session_state.get("draft_in", ""),
-            height=200,
-            placeholder="mult gallstones 4-11mm, no chole\nliver 14.2cm normal, no SOL\nkidneys nad",
-        )
+        in_col, out_col = st.columns(2, gap="large")
+
+        with in_col:
+            st.markdown("**Rough notes**")
+            section = st.selectbox(
+                "Rewrite",
+                ["the IMPRESSION only", "the FINDINGS only", "the whole report",
+                 "shorthand expansion only - expand the abbreviations verbatim, "
+                 "keep my wording and order exactly as written"],
+                format_func=lambda s: s.split(" - ")[0],
+                help="Narrower is safer. The IMPRESSION is where house style shows "
+                     "most. *Shorthand expansion only* just spells things out - "
+                     "no restyling at all.",
+            )
+            rough = st.text_area(
+                "Rough notes — shorthand is fine",
+                value=st.session_state.get("draft_in", ""),
+                height=220,
+                label_visibility="collapsed",
+                placeholder="mult gallstones 4-11mm, no chole\nliver 14.2cm normal, no SOL\nkidneys nad",
+            )
 
         def run_draft(notes: str, answers: dict) -> None:
             import ai_parser
@@ -2948,48 +2980,49 @@ with tab_draft:
             st.session_state["draft_questions"] = result["questions"]
             st.session_state["draft_assumptions"] = result["assumptions"]
 
-        if st.button(":material/edit_note: Write in this doctor's style", type="primary", disabled=not rough.strip()):
-            run_draft(rough, st.session_state.get("draft_answers", {}))
-            st.rerun()
+        with in_col:
+            if st.button(":material/edit_note: Write in this doctor's style",
+                         type="primary", width="stretch",
+                         disabled=not rough.strip()):
+                run_draft(rough, st.session_state.get("draft_answers", {}))
+                st.rerun()
 
-        # ---------------- Step 2: the AI asks ---------------- #
-
-        questions = st.session_state.get("draft_questions", [])
-        if questions:
-            st.subheader("A few things I am not sure about")
-            st.caption(
-                "Answer what matters and redraft. Anything you skip stays as the assumption "
-                "listed below. Answers you save are never asked again."
-            )
-            answers: dict[str, str] = {}
-            for q in questions:
-                options = list(q["options"]) + ["Let me type it"]
-                choice = st.radio(
-                    q["question"],
-                    options,
-                    key=f"q_opt_{q['id']}",
-                    horizontal=len(options) <= 3,
-                    help=q.get("why") or None,
+            # -------- the AI asks -------- #
+            questions = st.session_state.get("draft_questions", [])
+            if questions:
+                st.markdown("**A few things I am not sure about**")
+                st.caption(
+                    "Answer what matters and redraft. Anything you skip stays as the "
+                    "assumption listed below. Answers you save are never asked again."
                 )
-                if choice == "Let me type it":
-                    choice = st.text_input(
-                        "Your answer", key=f"q_txt_{q['id']}", placeholder="Type it as it should read"
+                answers: dict[str, str] = {}
+                for q in questions:
+                    options = list(q["options"]) + ["Let me type it"]
+                    choice = st.radio(
+                        q["question"],
+                        options,
+                        key=f"q_opt_{q['id']}",
+                        horizontal=len(options) <= 3,
+                        help=q.get("why") or None,
                     )
-                if choice:
-                    answers[q["question"]] = choice
+                    if choice == "Let me type it":
+                        choice = st.text_input(
+                            "Your answer", key=f"q_txt_{q['id']}",
+                            placeholder="Type it as it should read"
+                        )
+                    if choice:
+                        answers[q["question"]] = choice
 
-            ans_a, ans_b = st.columns([2, 1])
-            with ans_a:
-                if st.button(":material/refresh: Redraft with these answers", type="primary", width="stretch"):
+                if st.button(":material/refresh: Redraft with these answers",
+                             type="primary", width="stretch"):
                     merged = {**st.session_state.get("draft_answers", {}), **answers}
                     st.session_state["draft_answers"] = merged
                     run_draft(st.session_state.get("draft_in", rough), merged)
                     st.rerun()
-            with ans_b:
                 if st.button("Remember these answers", width="stretch",
                              disabled=template.builtin or not answers,
-                             help="Save them on this doctor's template so the question never "
-                                  "comes up again."):
+                             help="Save them on this doctor's template so the question "
+                                  "never comes up again."):
                     learned = template
                     for question, answer in answers.items():
                         learned = templates.remember_answer(learned, question, answer)
@@ -2998,96 +3031,149 @@ with tab_draft:
                     st.success(f"Saved {len(answers)} answer(s) to {doctor_label}.")
                     st.rerun()
 
-        for assumption in st.session_state.get("draft_assumptions", []):
-            st.caption(f"Assumed: {assumption}")
+            for assumption in st.session_state.get("draft_assumptions", []):
+                st.caption(f"Assumed: {assumption}")
 
-        # ---------------- Step 3: the doctor edits ---------------- #
+        # -------- the draft, the safety badges, the teaching -------- #
 
-        drafted = st.session_state.get("draft_out", "")
-        if drafted:
-            st.divider()
-            left, right = st.columns(2)
-            with left:
-                st.markdown("**Your notes**")
-                st.code(st.session_state.get("draft_in", ""), language=None)
-            with right:
-                st.markdown("**Draft — correct anything that is not how you write**")
-                drafted = st.text_area("Edit the draft", drafted, height=340, key="draft_edit")
-
-            try:
-                import ai_parser
-
-                dropped = ai_parser.missing_facts(st.session_state.get("draft_in", ""), drafted)
-            except Exception:
-                dropped = []
-
-            if dropped:
-                st.error(
-                    "These numbers from your notes are **not** in the draft: "
-                    + ", ".join(dropped)
-                    + ". Check nothing was lost or altered before using it."
+        with out_col:
+            drafted = st.session_state.get("draft_out", "")
+            if not drafted:
+                st.markdown("**Generated draft**")
+                st.caption(
+                    "The draft appears here, in this doctor's style, next to your "
+                    "notes. Correct anything that is not how they write — every "
+                    "correction can be taught."
                 )
             else:
-                st.success("Every number from your notes appears in the draft.")
-                st.caption(
-                    "This checks measurements only. It cannot tell you whether a finding was "
-                    "reworded — that is your read."
-                )
+                applied_bits = []
+                if template.preferences:
+                    applied_bits.append(f"{len(template.preferences)} learned rule(s)")
+                if template.corrections:
+                    applied_bits.append(f"{len(template.corrections)} past correction(s)")
+                if template.examples:
+                    applied_bits.append(f"{len(template.examples)} voice sample(s)")
+                st.markdown("**Generated draft — correct anything that is not how "
+                            "you write**")
+                if applied_bits:
+                    st.caption("Applied: " + " · ".join(applied_bits))
+                drafted = st.text_area("Edit the draft", drafted, height=340,
+                                       key="draft_edit",
+                                       label_visibility="collapsed")
 
-            # ---------------- Step 4: teach ---------------- #
+                notes_in = st.session_state.get("draft_in", "")
 
-            original = st.session_state.get("draft_original", "")
-            corrected = drafted.strip() != original.strip()
+                # Safety badge 1: negations. The generator already hard-stops on
+                # a flipped negative; this re-checks the DOCTOR'S EDITS too.
+                import negation as negation_engine
 
-            st.divider()
-            st.subheader("Teach this doctor's style")
-            if template.builtin:
-                st.caption(
-                    "The built-in HC FORMAT cannot learn. Create a template for this doctor "
-                    "with **➕ New** in the sidebar."
-                )
-            elif not corrected:
-                st.caption(
-                    "You have not changed the draft, so there is nothing to learn from yet. "
-                    "Correct anything that is not how you write, then this button turns on."
-                )
-            else:
-                note = st.text_input(
-                    "Why did you change it? (optional — one line makes the lesson much sharper)",
-                    key="draft_note",
-                    placeholder="I always write calculi, not stones, and I number the impression.",
-                )
-                if st.button(":material/school: Learn from my corrections", type="primary"):
+                try:
+                    mismatches, omissions = negation_engine.check_draft(notes_in,
+                                                                        drafted)
+                    negated_total = sum(
+                        1 for v in negation_engine.polarity_map(notes_in).values()
+                        if v)
+                except Exception:
+                    mismatches, omissions, negated_total = [], [], 0
+
+                if mismatches:
+                    st.error(
+                        "🔴 **Negation flipped**: "
+                        + ", ".join(f"“{m.entity}”" for m in mismatches)
+                        + " — negated in your notes but ASSERTED in this draft. "
+                        "Fix it before this text goes anywhere."
+                    )
+                elif omissions:
+                    st.warning(
+                        "🟡 Negatives from your notes not mentioned in the draft: "
+                        + ", ".join(f"“no {o}”" for o in omissions)
+                        + ". Often fine in a summary — confirm it is deliberate."
+                    )
+                elif negated_total:
+                    st.success(f"🟢 Negations intact ({negated_total}/{negated_total}).")
+
+                # Safety badge 2: measurements.
+                try:
                     import ai_parser
 
-                    rules: list[str] = []
-                    with st.spinner("Working out what you want in general..."):
-                        try:
-                            rules = ai_parser.distill_preferences(
-                                original, drafted, template, api_key, model_choice, note=note
-                            )
-                        except Exception as exc:
-                            st.warning(
-                                f"Could not distil a general rule ({exc}). Saving the correction "
-                                "itself, which the next draft still learns from."
-                            )
-                    learned = templates.remember_correction(
-                        template, original, drafted, note=note, rules=rules
+                    dropped = ai_parser.missing_facts(notes_in, drafted)
+                except Exception:
+                    dropped = []
+                if dropped:
+                    st.error(
+                        "🔴 **Numbers from your notes missing from the draft**: "
+                        + ", ".join(dropped)
+                        + ". Check nothing was lost or altered before using it."
                     )
-                    templates.save(learned)
-                    templates_changed()
-                    st.session_state["draft_original"] = drafted  # this edit is now taught
-                    if rules:
-                        st.success("Learned:")
-                        for rule in rules:
-                            st.markdown(f"- {rule}")
-                    else:
-                        st.success(
-                            "Correction saved. No general rule came out of this one, but the "
-                            "before/after pair goes into the next draft."
-                        )
-                    st.rerun()
+                else:
+                    st.success("🟢 Measurements preserved — every number from your "
+                               "notes appears in the draft.")
+                    st.caption(
+                        "The badges check polarity and numbers. Whether a finding "
+                        "was reworded correctly is your read."
+                    )
 
+                # -------- teach -------- #
+                original = st.session_state.get("draft_original", "")
+                corrected = drafted.strip() != original.strip()
+
+                if template.builtin:
+                    st.caption(
+                        "The built-in HC FORMAT cannot learn — create the doctor's "
+                        "profile with the button at the top of this tab."
+                    )
+                elif not corrected:
+                    st.caption(
+                        "Correct anything that is not how you write — the teach "
+                        "button turns on the moment the draft differs."
+                    )
+                else:
+                    note = st.text_input(
+                        "Why did you change it? (optional — one line makes the "
+                        "lesson much sharper)",
+                        key="draft_note",
+                        placeholder="I always write calculi, not stones, and I "
+                                    "number the impression.",
+                    )
+                    if st.button(":material/school: Save edits & teach style",
+                                 type="primary", width="stretch"):
+                        import ai_parser
+
+                        rules: list[str] = []
+                        with st.spinner("Working out what you want in general..."):
+                            try:
+                                rules = ai_parser.distill_preferences(
+                                    original, drafted, template, api_key,
+                                    model_choice, note=note
+                                )
+                            except Exception as exc:
+                                st.warning(
+                                    f"Could not distil a general rule ({exc}). "
+                                    "Saving the correction itself, which the next "
+                                    "draft still learns from."
+                                )
+                        learned = templates.remember_correction(
+                            template, original, drafted, note=note, rules=rules
+                        )
+                        templates.save(learned)
+                        templates_changed()
+                        st.session_state["draft_original"] = drafted
+                        if rules:
+                            st.success("Learned:")
+                            for rule in rules:
+                                st.markdown(f"- {rule}")
+                        else:
+                            st.success(
+                                "Correction saved. No general rule came out of "
+                                "this one, but the before/after pair goes into "
+                                "the next draft."
+                            )
+                        st.rerun()
+
+        # The finish section below reads the doctor's edited version.
+        drafted = st.session_state.get("draft_edit",
+                                       st.session_state.get("draft_out", ""))
+        if drafted:
             # ---------------- Finish ---------------- #
 
             st.divider()
