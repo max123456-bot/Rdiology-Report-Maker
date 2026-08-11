@@ -122,10 +122,10 @@ def sign_out_control() -> None:
     """A sign-out button, only when there is something to sign out of."""
     if oidc_configured() and signed_in():
         st.sidebar.caption(f"Signed in as {whoami()}")
-        if st.sidebar.button("Sign out", use_container_width=True):
+        if st.sidebar.button("Sign out", width="stretch"):
             st.logout()
     elif _configured("ACCESS_CODE") and st.session_state.get("access_ok"):
-        if st.sidebar.button("Lock", use_container_width=True,
+        if st.sidebar.button("Lock", width="stretch",
                              help="Require the access code again on this device."):
             st.session_state.pop("access_ok", None)
             st.rerun()

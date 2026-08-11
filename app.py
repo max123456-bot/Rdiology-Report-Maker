@@ -345,7 +345,7 @@ def _dialog_new():
     base_name = st.selectbox("Copy settings from", template_names, key="new_base")
     name = st.text_input("Template name", value="", placeholder="Dr. Sharad", key="new_name")
     doctor = st.text_input("Doctor", value="", placeholder="Dr. Sharad Kulkarni", key="new_doctor")
-    if st.button("Create", type="primary", use_container_width=True):
+    if st.button("Create", type="primary", width="stretch"):
         if not name.strip():
             st.error("Give the template a name.")
         elif name.strip() in all_templates:
@@ -400,7 +400,7 @@ def _dialog_edit(current: templates.Template):
         lh_contact = st.text_input("Phone / email", value=current.letterhead_contact,
                                    key="ed_lh_contact")
 
-    if st.button("Save changes", type="primary", use_container_width=True):
+    if st.button("Save changes", type="primary", width="stretch"):
         updated = templates.copy_of(current, name.strip() or current.name, doctor.strip())
         updated.font_name, updated.font_size, updated.font_color = font, float(size), colour
         updated.line_spacing = float(spacing)
@@ -441,7 +441,7 @@ def _dialog_seed_template(report_text: str, corrections: tuple[str, str] | None 
     )
     st.caption(f"Seeding with {len(report_text.split())} words of their writing.")
 
-    if st.button("Create doctor", type="primary", use_container_width=True):
+    if st.button("Create doctor", type="primary", width="stretch"):
         if not name.strip():
             st.error("Give the template a name.")
         elif name.strip() in all_templates:
@@ -471,24 +471,24 @@ def _dialog_delete(current: templates.Template):
         st.caption(f"Its {len(current.examples)} style example(s) go with it.")
     yes, no = st.columns(2)
     with yes:
-        if st.button("Delete", type="primary", use_container_width=True):
+        if st.button("Delete", type="primary", width="stretch"):
             templates.delete(current.name)
             templates_changed()
             st.session_state["tpl_pick"] = templates.HC_FORMAT.name
             st.rerun()
     with no:
-        if st.button("Cancel", use_container_width=True):
+        if st.button("Cancel", width="stretch"):
             st.rerun()
 
 
 with new_col:
-    if st.button(":material/add: New", use_container_width=True, help="Create a template for another doctor"):
+    if st.button(":material/add: New", width="stretch", help="Create a template for another doctor"):
         _dialog_new()
 with edit_col:
-    if st.button(":material/edit: Edit", use_container_width=True, help="Rename or change this template"):
+    if st.button(":material/edit: Edit", width="stretch", help="Rename or change this template"):
         _dialog_edit(template)
 with del_col:
-    if st.button(":material/delete: Delete", use_container_width=True, help="Delete this template"):
+    if st.button(":material/delete: Delete", width="stretch", help="Delete this template"):
         _dialog_delete(template)
 
 access.sign_out_control()
@@ -1035,7 +1035,7 @@ with tab_single:
             st.caption(f"This is the page Word will produce. Click any line to edit it. · {engine_used}")
         with reset:
             st.write("")
-            if st.button("Reset", use_container_width=True, help="Discard edits and re-detect."):
+            if st.button("Reset", width="stretch", help="Discard edits and re-detect."):
                 st.session_state["editor_resets"] = reset_count + 1
                 st.rerun()
 
@@ -1074,10 +1074,10 @@ with tab_single:
                 file_name=safe_filename(title),
                 mime=DOCX_MIME,
                 type="primary",
-                use_container_width=True,
+                width="stretch",
             )
 
-            if st.button("Also make a PDF", use_container_width=True):
+            if st.button("Also make a PDF", width="stretch"):
                 pdf_bytes = to_pdf(docx_bytes)
                 if pdf_bytes:
                     st.download_button(
@@ -1085,7 +1085,7 @@ with tab_single:
                         data=pdf_bytes,
                         file_name=safe_filename(title).replace(".docx", ".pdf"),
                         mime="application/pdf",
-                        use_container_width=True,
+                        width="stretch",
                     )
                 else:
                     st.info(
@@ -1320,7 +1320,7 @@ with tab_single:
                             "Now": d.after,
                             "Change": d.note,
                         } for d in deltas],
-                        use_container_width=True, hide_index=True,
+                        width="stretch", hide_index=True,
                     )
 
         # ----------------------- worklist & delivery ----------------------- #
@@ -1339,7 +1339,7 @@ with tab_single:
                 col_save, col_sign, _sp = st.columns([1, 1, 2])
                 with col_save:
                     if st.button(":material/playlist_add: Save to worklist",
-                                 use_container_width=True,
+                                 width="stretch",
                                  help="Stores this report as a draft: it appears in the "
                                       "Worklist tab and becomes this patient's history."):
                         rec = records.new_record(raw_text, blocks, source="paste")
@@ -1353,7 +1353,7 @@ with tab_single:
                         sign_help += (" There are critical check findings above - "
                                       "signing is still your call.")
                     if st.button(":material/draw: Sign & save", type="primary",
-                                 use_container_width=True, help=sign_help):
+                                 width="stretch", help=sign_help):
                         rec = records.new_record(raw_text, blocks, source="paste")
                         records.sign(rec, user=storage.current_user())
                         records.save(rec)
@@ -1373,13 +1373,13 @@ with tab_single:
                 with act_col:
                     if stored.get("status") == "draft":
                         if st.button(":material/draw: Sign report", type="primary",
-                                     use_container_width=True):
+                                     width="stretch"):
                             records.sign(stored, user=storage.current_user())
                             records.save(stored)
                             st.rerun()
                     elif stored.get("status") == "signed":
                         if st.button(":material/local_shipping: Mark delivered",
-                                     use_container_width=True,
+                                     width="stretch",
                                      help="Records that the report went out (with the "
                                           ".docx download as the channel)."):
                             records.deliver(stored, user=storage.current_user(),
@@ -1395,7 +1395,7 @@ with tab_single:
                         data=interop.hl7_oru(stored),
                         file_name=safe_filename(title).replace(".docx", ".hl7"),
                         mime="text/plain",
-                        use_container_width=True,
+                        width="stretch",
                         help="An HL7 v2.5 ORU^R01 message carrying the full report - "
                              "what a hospital integration engine (Mirth etc.) ingests.",
                     )
@@ -1405,7 +1405,7 @@ with tab_single:
                         data=interop.fhir_json(stored, docx_bytes),
                         file_name=safe_filename(title).replace(".docx", ".fhir.json"),
                         mime="application/fhir+json",
-                        use_container_width=True,
+                        width="stretch",
                         help="A FHIR R4 DiagnosticReport bundle with the report text "
                              "and the .docx attached.",
                     )
@@ -1467,7 +1467,7 @@ with tab_single:
             st.dataframe(
                 [{"#": i + 1, "Format": r["Format"], "Text": r["Text"][:110], "Value": r["Value"]}
                  for i, r in enumerate(blocks_to_rows(blocks))],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -1537,13 +1537,13 @@ with tab_worklist:
                 with b1:
                     if rec.get("status") == "draft":
                         if st.button("Sign", key=f"wl_sign_{rec['id']}",
-                                     use_container_width=True):
+                                     width="stretch"):
                             records.sign(rec, user=storage.current_user())
                             records.save(rec)
                             st.rerun()
                     elif rec.get("status") == "signed":
                         if st.button("Mark delivered", key=f"wl_deliver_{rec['id']}",
-                                     use_container_width=True):
+                                     width="stretch"):
                             records.deliver(rec, user=storage.current_user(),
                                             via="worklist")
                             records.save(rec)
@@ -1552,18 +1552,18 @@ with tab_worklist:
                     st.download_button(
                         "HL7 ORU", data=interop.hl7_oru(rec),
                         file_name=f"report-{rec['id']}.hl7", mime="text/plain",
-                        key=f"wl_hl7_{rec['id']}", use_container_width=True,
+                        key=f"wl_hl7_{rec['id']}", width="stretch",
                     )
                 with b3:
                     st.download_button(
                         "FHIR JSON", data=interop.fhir_json(rec),
                         file_name=f"report-{rec['id']}.fhir.json",
                         mime="application/fhir+json",
-                        key=f"wl_fhir_{rec['id']}", use_container_width=True,
+                        key=f"wl_fhir_{rec['id']}", width="stretch",
                     )
                 with b4:
                     if st.button("Delete", key=f"wl_del_{rec['id']}",
-                                 use_container_width=True,
+                                 width="stretch",
                                  help="Removes the record from the worklist and the "
                                       "patient's history. The audit log entry stays."):
                         storage.get_store().delete_report(active_tenant(), rec["id"])
@@ -1633,7 +1633,7 @@ with tab_worklist:
                         with c1:
                             if st.button("Fetch .dcm for cross-check",
                                          key=f"orth_fetch_{study['id']}",
-                                         use_container_width=True):
+                                         width="stretch"):
                                 instance = pacs.orthanc_first_instance(study["id"])
                                 st.session_state[f"orth_file_{study['id']}"] = \
                                     pacs.orthanc_instance_file(instance)
@@ -1644,14 +1644,14 @@ with tab_worklist:
                                     file_name=f"{study['id'][:12]}.dcm",
                                     mime="application/dicom",
                                     key=f"orth_dl_{study['id']}",
-                                    use_container_width=True,
+                                    width="stretch",
                                     help="Drop it into the DICOM cross-check on "
                                          "the Report tab.",
                                 )
                         with c2:
                             preview_key = f"orth_png_{study['id']}"
                             if st.button("Load preview", key=f"orth_prev_{study['id']}",
-                                         use_container_width=True):
+                                         width="stretch"):
                                 instance = pacs.orthanc_first_instance(study["id"])
                                 st.session_state[preview_key] = \
                                     pacs.orthanc_preview_png(instance)
@@ -1690,7 +1690,7 @@ with tab_worklist:
                 with rc3:
                     st.write("")
                     if st.button(":material/play_arrow: Start listening",
-                                 use_container_width=True):
+                                 width="stretch"):
                         try:
                             pacs.start_receiver(int(rx_port), aet=rx_aet.strip()
                                                 or pacs.DEFAULT_AET)
@@ -1731,7 +1731,7 @@ with tab_worklist:
                                 file_name=os.path.basename(first),
                                 mime="application/dicom",
                                 key=f"rx_dl_{study['study_uid']}",
-                                use_container_width=True,
+                                width="stretch",
                             )
                     with rcv2:
                         try:
@@ -1746,7 +1746,7 @@ with tab_worklist:
                             st.caption(f"No renderable pixels: {exc}")
                     with rcv3:
                         if st.button("Remove", key=f"rx_rm_{study['study_uid']}",
-                                     use_container_width=True,
+                                     width="stretch",
                                      help="Deletes the spooled files from this "
                                           "machine."):
                             pacs.clear_received(study["study_uid"])
@@ -1767,7 +1767,7 @@ with tab_worklist:
                                        key="qr_aet")
             e1, e2 = st.columns([1, 3])
             with e1:
-                if st.button("C-ECHO test", use_container_width=True):
+                if st.button("C-ECHO test", width="stretch"):
                     ok, detail = pacs.echo(qr_host.strip(), int(qr_port),
                                            qr_aet.strip() or "ANY-SCP")
                     (st.success if ok else st.error)(detail)
@@ -1795,7 +1795,7 @@ with tab_worklist:
                                   "Description": r["description"],
                                   "Modalities": r["modalities"]}
                                  for r in found],
-                                use_container_width=True, hide_index=True,
+                                width="stretch", hide_index=True,
                             )
                     except RuntimeError as exc:
                         st.error(str(exc))
@@ -1866,7 +1866,7 @@ with tab_batch:
         else:
             st.success(f"All {len(rows)} report(s) converted, audit passed.")
 
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
         st.download_button(
             ":material/folder_zip: Download all as ZIP",
             data=buf.getvalue(),
@@ -1910,7 +1910,7 @@ with tab_dictate:
                 f"{len(template.dictation_fixes)} past mishearing(s) · model `{model_choice}`"
             )
         with clear_col:
-            if st.button("Clear", use_container_width=True, key="dict_clear"):
+            if st.button("Clear", width="stretch", key="dict_clear"):
                 for key in list(st.session_state):
                     if key.startswith("dict_"):
                         st.session_state.pop(key, None)
@@ -2319,13 +2319,13 @@ with tab_dictate:
             go_draft, go_report = st.columns(2)
             with go_draft:
                 if st.button(":material/edit_note: Send to drafting", type="primary",
-                             use_container_width=True, key="dict_to_draft",
+                             width="stretch", key="dict_to_draft",
                              help="Rewrites it into this doctor's house style. Use for rough "
                                   "notes. You pick the report format afterwards."):
                     st.session_state["draft_in"] = transcript
                     st.success("Loaded — open **Draft in doctor's style**.")
             with go_report:
-                if st.button(":material/arrow_forward: Send to report", use_container_width=True,
+                if st.button(":material/arrow_forward: Send to report", width="stretch",
                              key="dict_to_single",
                              help="Straight to formatting, word for word. Use when you dictated "
                                   "the finished report."):
@@ -2380,7 +2380,7 @@ with tab_draft:
                 f"{templates.learning_summary(template)} · model `{model_choice}`"
             )
         with reset_draft:
-            if st.button("Start over", use_container_width=True):
+            if st.button("Start over", width="stretch"):
                 for key in ("draft_out", "draft_in", "draft_questions", "draft_assumptions",
                             "draft_answers", "draft_original", "draft_section"):
                     st.session_state.pop(key, None)
@@ -2464,13 +2464,13 @@ with tab_draft:
 
             ans_a, ans_b = st.columns([2, 1])
             with ans_a:
-                if st.button(":material/refresh: Redraft with these answers", type="primary", use_container_width=True):
+                if st.button(":material/refresh: Redraft with these answers", type="primary", width="stretch"):
                     merged = {**st.session_state.get("draft_answers", {}), **answers}
                     st.session_state["draft_answers"] = merged
                     run_draft(st.session_state.get("draft_in", rough), merged)
                     st.rerun()
             with ans_b:
-                if st.button("Remember these answers", use_container_width=True,
+                if st.button("Remember these answers", width="stretch",
                              disabled=template.builtin or not answers,
                              help="Save them on this doctor's template so the question never "
                                   "comes up again."):
@@ -2586,7 +2586,7 @@ with tab_draft:
                     "Adds this report to their voice samples and keeps every rule learned above. "
                     "Use this for a doctor who already has a template."
                 )
-                if st.button(f":material/library_add: Save to {doctor_label}", use_container_width=True,
+                if st.button(f":material/library_add: Save to {doctor_label}", width="stretch",
                              disabled=template.builtin, type="primary"):
                     learned = templates.remember_example(template, drafted)
                     if corrected:
@@ -2605,7 +2605,7 @@ with tab_draft:
                     "Creates a fresh template — formatting, letterhead and voice — seeded with "
                     "this report. Use this the first time a doctor's work comes through."
                 )
-                if st.button(":material/person_add: Create a doctor from this report", use_container_width=True):
+                if st.button(":material/person_add: Create a doctor from this report", width="stretch"):
                     _dialog_seed_template(drafted, (original, drafted) if corrected else None)
 
             st.download_button(
@@ -2615,7 +2615,7 @@ with tab_draft:
                 mime="text/plain",
             )
             if st.button(":material/arrow_forward: Send to report", type="primary",
-                          use_container_width=True,
+                          width="stretch",
                           help="Choose the doctor's format there; from that point the text is "
                                "treated verbatim and the audit applies again."):
                 st.session_state["prefill"] = drafted
@@ -2696,7 +2696,7 @@ with tab_templates:
         style_rows,
         key=f"tpl_styles::{editing_name}",
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "Line": st.column_config.TextColumn("Line", disabled=True),
             "Align": st.column_config.SelectboxColumn("Align", options=list(templates.ALIGNMENTS)),
@@ -2862,7 +2862,7 @@ with tab_templates:
     act1, act2, act3 = st.columns(3)
     with act1:
         if st.button(":material/save: Save" + (" •" if dirty else ""),
-                     use_container_width=True, type="primary" if dirty else "secondary",
+                     width="stretch", type="primary" if dirty else "secondary",
                      disabled=editing.builtin,
                      help="The built-in HC FORMAT cannot be overwritten."
                           if editing.builtin else "Write these changes to disk."):
@@ -2875,7 +2875,7 @@ with tab_templates:
                 st.success(f"Saved “{t_name}”.")
                 st.rerun()
     with act2:
-        if st.button(":material/content_copy: Save as new", use_container_width=True,
+        if st.button(":material/content_copy: Save as new", width="stretch",
                      type="primary" if (dirty and editing.builtin) else "secondary",
                      help="Keep the original and create a second template from these settings."):
             new_name = t_name if t_name != editing.name else f"{t_name} copy"
@@ -2887,7 +2887,7 @@ with tab_templates:
                 st.success(f"Created “{new_name}”. Pick it as the report format.")
                 st.rerun()
     with act3:
-        if st.button(":material/delete: Delete", use_container_width=True,
+        if st.button(":material/delete: Delete", width="stretch",
                      disabled=editing.builtin):
             _dialog_delete(editing)
 
@@ -2917,7 +2917,7 @@ with tab_templates:
                     }
                     for e in rows
                 ],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             if not any(e.user for e in rows):

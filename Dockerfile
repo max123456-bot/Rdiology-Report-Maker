@@ -32,11 +32,15 @@ ENV PYTHONUNBUFFERED=1
 # Secrets (GEMINI_API_KEY, STORAGE_URL, ACCESS_CODE...) come from environment
 # variables - every secret reader in this codebase falls back to the
 # environment when .streamlit/secrets.toml is absent.
+# fileWatcherType none: code never changes inside a running container, and
+# the watcher's inotify instances exhaust Render's per-container limit
+# ("OSError: inotify instance limit reached" spamming the logs).
 EXPOSE 8501
 CMD streamlit run app.py \
     --server.port ${PORT:-8501} \
     --server.address 0.0.0.0 \
     --server.headless true \
+    --server.fileWatcherType none \
     --server.enableCORS false \
     --server.enableXsrfProtection true \
     --browser.gatherUsageStats false
