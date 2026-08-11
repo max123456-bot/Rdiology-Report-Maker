@@ -383,8 +383,13 @@ class SqlStore:
             # Without an explicit timeout an unreachable host blocks forever and
             # takes the whole app with it - which is exactly what happens when a
             # free-tier database is paused, moved, or the URL is stale.
+            # Keepalives, because serverless Postgres (Neon) suspends idle
+            # computes and silently closes the session; the probes keep a
+            # mostly-idle clinic app's connection from going stale so often.
             self._conn = psycopg.connect(
-                self.url, autocommit=True, connect_timeout=CONNECT_TIMEOUT
+                self.url, autocommit=True, connect_timeout=CONNECT_TIMEOUT,
+                keepalives=1, keepalives_idle=30, keepalives_interval=10,
+                keepalives_count=3,
             )
             self._ph = "%s"
         else:
@@ -527,11 +532,52 @@ class SqlStore:
     def _loads(self, value) -> dict:
         return value if isinstance(value, dict) else json.loads(value)
 
+    # -- dropped-connection recovery --------------------------------------- #
+
+    _DISCONNECT_MARKERS = (
+        "ssl connection has been closed", "server closed the connection",
+        "connection is closed", "connection already closed",
+        "consuming input failed", "eof detected", "connection reset",
+        "terminating connection", "broken pipe", "bad connection",
+    )
+
+    @classmethod
+    def _is_disconnect(cls, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return any(marker in message for marker in cls._DISCONNECT_MARKERS)
+
+    def _reconnect(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+        self._connect()
+
+    def _run(self, action):
+        """
+        Run action(cursor) under the lock, rebuilding the connection once if
+        the server dropped it.
+
+        Neon (and serverless Postgres generally) suspends an idle compute and
+        closes the session; the next query on the cached connection then dies
+        with "SSL connection has been closed unexpectedly". That is not an
+        error in the request - the request never arrived - so it is retried
+        exactly once on a fresh connection. A second failure is real and
+        raises.
+        """
+        with self._lock:
+            try:
+                return action(self._conn.cursor())
+            except Exception as exc:
+                if not (self.is_postgres and self._is_disconnect(exc)):
+                    raise
+                self._reconnect()
+                return action(self._conn.cursor())
+
     # -- Store ------------------------------------------------------------ #
 
     def load_all(self, tenant: str) -> dict[str, dict]:
-        with self._lock:
-            cur = self._conn.cursor()
+        def go(cur):
             cur.execute(
                 f"SELECT name, payload FROM templates WHERE tenant = {self._ph}",
                 (clean_tenant(tenant),),
@@ -544,9 +590,10 @@ class SqlStore:
                     continue
             return out
 
+        return self._run(go)
+
     def fingerprint(self, tenant: str, name: str) -> str:
-        with self._lock:
-            cur = self._conn.cursor()
+        def go(cur):
             cur.execute(
                 f"SELECT version FROM templates WHERE tenant = {self._ph} AND name = {self._ph}",
                 (clean_tenant(tenant), name),
@@ -554,11 +601,13 @@ class SqlStore:
             row = cur.fetchone()
             return str(row[0]) if row else ""
 
+        return self._run(go)
+
     def save(self, tenant: str, name: str, payload: dict,
              expect: str | None = None) -> None:
         tenant = clean_tenant(tenant)
-        with self._lock:
-            cur = self._conn.cursor()
+
+        def go(cur):
             cur.execute(
                 f"SELECT version FROM templates WHERE tenant = {self._ph} AND name = {self._ph}",
                 (tenant, name),
@@ -596,9 +645,10 @@ class SqlStore:
             if not self.is_postgres:
                 self._conn.commit()
 
+        self._run(go)
+
     def delete(self, tenant: str, name: str) -> bool:
-        with self._lock:
-            cur = self._conn.cursor()
+        def go(cur):
             cur.execute(
                 f"DELETE FROM templates WHERE tenant = {self._ph} AND name = {self._ph}",
                 (clean_tenant(tenant), name),
@@ -608,11 +658,14 @@ class SqlStore:
                 self._conn.commit()
             return deleted
 
+        return self._run(go)
+
     def tenants(self) -> list[str]:
-        with self._lock:
-            cur = self._conn.cursor()
+        def go(cur):
             cur.execute("SELECT DISTINCT tenant FROM templates ORDER BY tenant")
             return [str(r[0]) for r in cur.fetchall()]
+
+        return self._run(go)
 
     # -- report records ---------------------------------------------------- #
 
@@ -625,8 +678,8 @@ class SqlStore:
         status = str(record.get("status") or "draft")
         urgency = str(record.get("urgency") or "routine")
         patient_key = str(record.get("patient_key") or "")
-        with self._lock:
-            cur = self._conn.cursor()
+
+        def go(cur):
             cur.execute(
                 f"SELECT 1 FROM reports WHERE tenant = {self._ph} AND id = {self._ph}",
                 (tenant, report_id),
@@ -650,9 +703,10 @@ class SqlStore:
             if not self.is_postgres:
                 self._conn.commit()
 
+        self._run(go)
+
     def get_report(self, tenant: str, report_id: str) -> dict | None:
-        with self._lock:
-            cur = self._conn.cursor()
+        def go(cur):
             cur.execute(
                 f"SELECT payload FROM reports WHERE tenant = {self._ph} AND id = {self._ph}",
                 (clean_tenant(tenant), str(report_id)),
@@ -664,6 +718,8 @@ class SqlStore:
                 return self._loads(row[0])
             except Exception:
                 return None
+
+        return self._run(go)
 
     def list_reports(self, tenant: str, status: str | None = None,
                      patient_key: str | None = None, limit: int = 200) -> list[dict]:
@@ -677,8 +733,8 @@ class SqlStore:
             params.append(patient_key)
         query += f" ORDER BY updated DESC LIMIT {self._ph}"
         params.append(int(limit))
-        with self._lock:
-            cur = self._conn.cursor()
+
+        def go(cur):
             cur.execute(query, tuple(params))
             rows: list[dict] = []
             for (payload,) in cur.fetchall():
@@ -688,9 +744,10 @@ class SqlStore:
                     continue
             return rows
 
+        return self._run(go)
+
     def delete_report(self, tenant: str, report_id: str) -> bool:
-        with self._lock:
-            cur = self._conn.cursor()
+        def go(cur):
             cur.execute(
                 f"DELETE FROM reports WHERE tenant = {self._ph} AND id = {self._ph}",
                 (clean_tenant(tenant), str(report_id)),
@@ -700,23 +757,25 @@ class SqlStore:
                 self._conn.commit()
             return deleted
 
+        return self._run(go)
+
     def record(self, event: Event) -> None:
+        def go(cur):
+            cur.execute(
+                f"INSERT INTO events (when_, kind, subject, detail, user_) "
+                f"VALUES ({self._ph}, {self._ph}, {self._ph}, {self._ph}, {self._ph})",
+                (event.when, event.kind, event.subject, event.detail, event.user),
+            )
+            if not self.is_postgres:
+                self._conn.commit()
+
         try:
-            with self._lock:
-                cur = self._conn.cursor()
-                cur.execute(
-                    f"INSERT INTO events (when_, kind, subject, detail, user_) "
-                    f"VALUES ({self._ph}, {self._ph}, {self._ph}, {self._ph}, {self._ph})",
-                    (event.when, event.kind, event.subject, event.detail, event.user),
-                )
-                if not self.is_postgres:
-                    self._conn.commit()
+            self._run(go)
         except Exception:
             pass  # the audit log must never block clinical work
 
     def events(self, limit: int = 200) -> list[Event]:
-        with self._lock:
-            cur = self._conn.cursor()
+        def go(cur):
             cur.execute(
                 f"SELECT when_, kind, subject, detail, user_ FROM events "
                 f"ORDER BY id DESC LIMIT {self._ph}",
@@ -726,6 +785,8 @@ class SqlStore:
                 Event(when=r[0], kind=r[1], subject=r[2], detail=r[3] or "", user=r[4] or "")
                 for r in cur.fetchall()
             ]
+
+        return self._run(go)
 
     def describe(self) -> str:
         if self.is_postgres:

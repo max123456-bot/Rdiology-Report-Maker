@@ -387,6 +387,73 @@ for point in points:
 
 
 # --------------------------------------------------------------------------- #
+print("\nstorage - dropped-connection recovery (the Neon idle-suspend case)")
+# --------------------------------------------------------------------------- #
+
+import os as _os  # noqa: E402
+import shutil as _shutil  # noqa: E402
+import tempfile as _tempfile  # noqa: E402
+
+import storage as storage_mod  # noqa: E402
+
+_tmp = _tempfile.mkdtemp(prefix="hc-master-conn-")
+conn_store = storage_mod.SqlStore(
+    "sqlite:///" + _os.path.join(_tmp, "r.db").replace("\\", "/"))
+conn_store.save_report("t", {"id": "abc123", "status": "draft",
+                             "report_text": "x", "updated": "2026-08-11"})
+_good_conn = conn_store._conn
+
+
+class _DeadConn:
+    """What a Neon-suspended session looks like to the next query."""
+
+    def cursor(self):
+        raise RuntimeError(
+            "consuming input failed: SSL connection has been closed unexpectedly")
+
+    def close(self):
+        pass
+
+
+class _BadSqlConn:
+    def cursor(self):
+        raise RuntimeError("syntax error at or near SELECT")
+
+    def close(self):
+        pass
+
+
+conn_store.is_postgres = True          # the retry path is postgres-only
+conn_store._conn = _DeadConn()
+_reconnects = []
+conn_store._reconnect = lambda: (_reconnects.append(1),
+                                 setattr(conn_store, "_conn", _good_conn))[0] and None
+
+rows = conn_store.list_reports("t")
+check(len(rows) == 1 and len(_reconnects) == 1,
+      "a dropped SSL connection reconnects once and the query succeeds")
+
+conn_store._conn = _BadSqlConn()
+try:
+    conn_store.list_reports("t")
+    check(False, "a genuine SQL error was swallowed by the retry")
+except RuntimeError:
+    check(len(_reconnects) == 1,
+          "a genuine SQL error raises without touching the connection")
+
+check(storage_mod.SqlStore._is_disconnect(
+    RuntimeError("server closed the connection unexpectedly")),
+    "other libpq disconnect wordings are recognised too")
+check(not storage_mod.SqlStore._is_disconnect(RuntimeError("deadlock detected")),
+      "a deadlock is not mistaken for a disconnect")
+
+conn_store._conn = _good_conn
+conn_store.is_postgres = False
+conn_store.close()
+_shutil.rmtree(_tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 print("\napi - the FastAPI layer, endpoints called directly")
 # --------------------------------------------------------------------------- #
 
