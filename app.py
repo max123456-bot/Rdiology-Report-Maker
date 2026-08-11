@@ -2995,6 +2995,10 @@ with tab_draft:
             st.session_state["draft_section"] = section
             st.session_state["draft_out"] = result["draft"]
             st.session_state["draft_original"] = result["draft"]  # the untouched AI version
+            # The output editor is a KEYED widget, and a keyed widget ignores
+            # its value parameter after the first mount - without this line a
+            # regeneration quietly kept showing the PREVIOUS draft.
+            st.session_state["draft_edit"] = result["draft"]
             st.session_state["draft_questions"] = result["questions"]
             st.session_state["draft_assumptions"] = result["assumptions"]
 
