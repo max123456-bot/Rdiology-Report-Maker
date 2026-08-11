@@ -22,18 +22,21 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import access
+import anatomy
 import deid
 import dicom_meta
 import dictation_fix
 import guidelines
 import impression as impression_engine
 import interop
+import mllp
 import notify
 import pacs
 import providers
 import readers
 import records
 import storage
+import stt
 import templates
 import triage as triage_engine
 import validate
@@ -1152,6 +1155,26 @@ with tab_single:
                         if f.where:
                             st.caption(f"in {f.where}")
 
+            # The radiology lexicon watches pasted text too, not just
+            # dictation. Suggestions only - nothing is ever auto-corrected.
+            spell = [
+                s for s in (dictation_fix.clean(raw_text,
+                                                template.vocabulary).suggestions or [])
+                if s.reason in ("spelling", "sound", "anchor") and s.confidence >= 0.8
+            ]
+            if spell:
+                with st.expander(
+                    f":material/spellcheck: Possible misspelt terms ({len(spell)})"
+                ):
+                    for s in spell:
+                        st.markdown(f"“{s.heard}” → **{s.suggested}** "
+                                    f"· {s.reason} match, {int(s.confidence * 100)}%")
+                    st.caption(
+                        "Suggestions from the doctor's vocabulary and the built-in "
+                        "radiology lexicon. Nothing is changed automatically - edit "
+                        "the line above if a suggestion is right."
+                    )
+
             st.divider()
             render_audit(audit_result, user_edited=user_edited,
                          raw_text=raw_text, docx_bytes=docx_bytes)
@@ -1484,6 +1507,31 @@ with tab_single:
                              "and the .docx attached.",
                     )
 
+                mllp_target = mllp.mllp_config()
+                if mllp_target and stored.get("status") in ("signed", "delivered"):
+                    if st.button(
+                        f":material/send: Push ORU to RIS over MLLP "
+                        f"({mllp_target['host']}:{mllp_target['port']})",
+                        help="Sends the report as an HL7 ORU^R01 over MLLP and "
+                             "waits for the receiver's ACK — 'sent' means the "
+                             "RIS answered AA, not that bytes left this machine.",
+                    ):
+                        outcome = mllp.send_oru(mllp_target["host"],
+                                                mllp_target["port"], stored)
+                        (st.success if outcome.ok else st.error)(outcome.detail)
+                        if outcome.ok:
+                            storage.log("hl7.pushed",
+                                        stored.get("study") or stored.get("id", ""),
+                                        detail=f"{mllp_target['host']}:"
+                                               f"{mllp_target['port']}")
+                            if stored.get("status") == "signed" \
+                                    and access.can("deliver"):
+                                records.deliver(stored,
+                                                user=storage.current_user(),
+                                                via="hl7-mllp")
+                                records.save(stored)
+                                st.rerun()
+
                 if stored.get("urgency") in ("stat", "urgent") and \
                         stored.get("status") in ("signed", "delivered"):
                     st.markdown("**Critical result alert**")
@@ -1545,6 +1593,58 @@ with tab_single:
                 hide_index=True,
             )
 
+        with st.expander(":material/account_tree: Anatomy map — how the findings organise"):
+            if not findings_only.strip():
+                st.caption("No FINDINGS section detected — nothing to map.")
+            else:
+                st.caption(
+                    "The findings, organised REGION → organ → sub-part. A sentence "
+                    "that names no organ (“It measures 2.5 cm…”) is attached to the "
+                    "organ in context. This is a view for checking coverage — the "
+                    "report text itself is untouched."
+                )
+                tree = anatomy.findings_tree(findings_only)
+                for region, organs in tree.items():
+                    icon = "❓" if region == "UNASSIGNED" else "🫁" if region == "CHEST" \
+                        else "🧠" if region == "BRAIN" else "🩻"
+                    st.markdown(f"**{icon} {region}**")
+                    for organ_key, subparts in organs.items():
+                        for subpart, sentences in subparts.items():
+                            label = organ_key if subpart == anatomy.GENERAL \
+                                else f"{organ_key} · {subpart}"
+                            st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;**{label}**",
+                                        unsafe_allow_html=False)
+                            for sentence in sentences:
+                                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"
+                                            f"&nbsp;&nbsp;· {sentence}")
+                if "UNASSIGNED" in tree:
+                    st.warning(
+                        "Some sentences could not be placed under any organ — "
+                        "worth a glance that nothing is floating free.",
+                        icon=":material/help:",
+                    )
+
+                sizes = records.extract_measurements(findings_only)
+                if sizes:
+                    st.markdown("**Measurements detected**")
+                    st.dataframe(
+                        [{
+                            "Structure": m["key"],
+                            "Stated as": m["stated"],
+                            "In mm": m["size_mm"],
+                            "How": ("stated directly" if m.get("via") == "stated"
+                                    else "carried from the previous sentence"),
+                        } for m in sizes],
+                        width="stretch", hide_index=True,
+                    )
+                    if any(m.get("via") == "anaphora" for m in sizes):
+                        st.caption(
+                            "“Carried” rows came from sentences like “It measures "
+                            "2.5 cm” — the size was attached to the structure the "
+                            "dictation was talking about. Check the pairing reads "
+                            "right."
+                        )
+
 
 # ------------------------------ Worklist ----------------------------------- #
 
@@ -1554,7 +1654,13 @@ with tab_worklist:
         "delivery are recorded here and in the audit log."
     )
     try:
-        head_l, head_r = st.columns([3, 1])
+        head_l, refresh_col, head_r = st.columns([2.4, 0.6, 1])
+        with refresh_col:
+            st.write("")
+            if st.button(":material/refresh: Refresh", width="stretch",
+                         help="Re-read the worklist — new HL7 orders and "
+                              "reports saved from other tabs appear here."):
+                st.rerun()
         with head_r:
             wl_status = st.selectbox(
                 "Show", ["all", "draft", "signed", "delivered"], key="wl_status"
@@ -1662,6 +1768,26 @@ with tab_worklist:
                         storage.get_store().delete_report(active_tenant(), rec["id"])
                         storage.log("report.deleted", rec.get("study") or rec["id"])
                         st.rerun()
+
+                wl_mllp = mllp.mllp_config()
+                if wl_mllp and rec.get("status") in ("signed", "delivered"):
+                    if st.button(
+                        f":material/send: Push ORU to RIS "
+                        f"({wl_mllp['host']}:{wl_mllp['port']})",
+                        key=f"wl_mllp_{rec['id']}",
+                    ):
+                        outcome = mllp.send_oru(wl_mllp["host"], wl_mllp["port"],
+                                                rec)
+                        (st.success if outcome.ok else st.error)(outcome.detail)
+                        if outcome.ok:
+                            storage.log("hl7.pushed",
+                                        rec.get("study") or rec["id"])
+                            if rec.get("status") == "signed" \
+                                    and access.can("deliver"):
+                                records.deliver(rec, user=storage.current_user(),
+                                                via="hl7-mllp")
+                                records.save(rec)
+                                st.rerun()
     except AttributeError:
         stale_modules_banner()
 
@@ -1845,7 +1971,44 @@ with tab_worklist:
                             pacs.clear_received(study["study_uid"])
                             st.rerun()
 
-    with st.expander(":material/search: Query a PACS (C-ECHO / C-FIND)"):
+    with st.expander(":material/rss_feed: HL7 order listener (MLLP)"):
+        st.caption(
+            "The HIS pushes ORM^O01 order messages here and each order becomes "
+            "a draft on this worklist — the patient is waiting before anyone "
+            "types. Works on the clinic-LAN install; cloud hosts cannot accept "
+            "inbound TCP. Press Refresh above to see newly arrived orders."
+        )
+        order_listener = mllp.listener_running()
+        if order_listener is None:
+            ol_port_col, ol_btn_col = st.columns([1, 1.4])
+            with ol_port_col:
+                ol_port = st.number_input("Port", value=6661, min_value=1,
+                                          max_value=65535, key="ol_port")
+            with ol_btn_col:
+                st.write("")
+                if st.button(":material/play_arrow: Start order listener",
+                             width="stretch"):
+                    try:
+                        mllp.start_order_listener(int(ol_port),
+                                                  tenant=active_tenant())
+                        storage.log("hl7.listener", f"port {ol_port}",
+                                    detail="started")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not start: {exc}")
+        else:
+            st.success(
+                f"Listening on port **{order_listener.port}** · "
+                f"{order_listener.received} order(s) received, "
+                f"{order_listener.errors} rejected this session"
+            )
+            if st.button(":material/stop: Stop order listener"):
+                mllp.stop_order_listener()
+                storage.log("hl7.listener", f"port {order_listener.port}",
+                            detail="stopped")
+                st.rerun()
+
+    with st.expander(":material/search: Query a PACS (C-ECHO / C-FIND / MWL)"):
         if not pacs.PYNETDICOM_OK:
             st.caption("Querying needs pynetdicom:  `pip install pynetdicom`.")
         else:
@@ -1869,35 +2032,94 @@ with tab_worklist:
                     "Patient name filter (DICOM wildcards, e.g. SHARMA*)",
                     key="qr_name",
                 )
-            if st.button(":material/search: C-FIND studies", type="primary"):
-                if not qr_host.strip():
-                    st.error("A PACS host is needed.")
-                else:
-                    try:
-                        found = pacs.find_studies(
-                            qr_host.strip(), int(qr_port),
-                            qr_aet.strip() or "ANY-SCP",
-                            patient_name=qr_name.strip() or "*",
-                        )
-                        if not found:
-                            st.info("The PACS answered with no matching studies.")
-                        else:
-                            st.dataframe(
-                                [{"Patient": r["patient"], "Sex": r["sex"],
-                                  "Date": r["study_date"],
-                                  "Description": r["description"],
-                                  "Modalities": r["modalities"]}
-                                 for r in found],
-                                width="stretch", hide_index=True,
+            find_col, mwl_col = st.columns(2)
+            with find_col:
+                if st.button(":material/search: C-FIND studies", type="primary",
+                             width="stretch"):
+                    if not qr_host.strip():
+                        st.error("A PACS host is needed.")
+                    else:
+                        try:
+                            found = pacs.find_studies(
+                                qr_host.strip(), int(qr_port),
+                                qr_aet.strip() or "ANY-SCP",
+                                patient_name=qr_name.strip() or "*",
                             )
-                    except RuntimeError as exc:
-                        st.error(str(exc))
+                            if not found:
+                                st.info("The PACS answered with no matching studies.")
+                            else:
+                                st.dataframe(
+                                    [{"Patient": r["patient"], "Sex": r["sex"],
+                                      "Date": r["study_date"],
+                                      "Description": r["description"],
+                                      "Modalities": r["modalities"]}
+                                     for r in found],
+                                    width="stretch", hide_index=True,
+                                )
+                        except RuntimeError as exc:
+                            st.error(str(exc))
+            with mwl_col:
+                if st.button(":material/event_list: Query modality worklist (MWL)",
+                             width="stretch",
+                             help="What is SCHEDULED on the PACS/RIS worklist "
+                                  "server — pick the patient instead of typing "
+                                  "demographics."):
+                    if not qr_host.strip():
+                        st.error("A worklist host is needed.")
+                    else:
+                        try:
+                            st.session_state["mwl_rows"] = pacs.mwl_query(
+                                qr_host.strip(), int(qr_port),
+                                qr_aet.strip() or "ANY-SCP",
+                            )
+                        except RuntimeError as exc:
+                            st.session_state.pop("mwl_rows", None)
+                            st.error(str(exc))
+
+            mwl_rows = st.session_state.get("mwl_rows")
+            if mwl_rows is not None:
+                if not mwl_rows:
+                    st.info("The worklist server answered with nothing scheduled.")
+                for i, entry in enumerate(mwl_rows):
+                    with st.container(border=True):
+                        st.markdown(
+                            f"**{entry['patient'] or 'Unnamed'}** · "
+                            f"{entry['sex'] or '?'} · "
+                            f"{entry['procedure'] or entry['modality'] or 'Study'} · "
+                            f"scheduled {entry['scheduled'] or '?'} · "
+                            f"acc {entry['accession'] or '—'}"
+                        )
+                        if st.button(":material/edit_note: Start this report",
+                                     key=f"mwl_start_{i}",
+                                     help="Prefills the Report tab with the "
+                                          "patient's headings — open it and "
+                                          "dictate or paste the findings."):
+                            study_line = (entry["procedure"]
+                                          or entry["modality"] or "STUDY").upper()
+                            if not study_line.endswith("REPORT"):
+                                study_line += " REPORT"
+                            st.session_state["prefill"] = "\n".join([
+                                study_line, "",
+                                f"PATIENT NAME: {entry['patient']}".rstrip(": "),
+                                f"AGE/SEX: {entry['sex']}".rstrip(": "),
+                                (f"REFERRED BY: {entry['referrer']}"
+                                 if entry.get("referrer") else ""),
+                                "", "FINDINGS:", "", "", "IMPRESSION:", "",
+                            ])
+                            st.success("The Report tab is prefilled — open it "
+                                       "and add the findings.")
 
 
 # ------------------------------- Batch ------------------------------------- #
 
 with tab_batch:
-    st.caption("Several files, or many reports separated by a line of `---`. Returns one ZIP.")
+    import batch as batch_engine
+
+    st.caption(
+        "Files, a `---`-separated paste, or a spreadsheet — every report is "
+        "formatted, audited and QC-checked, shown in a summary table, and "
+        "delivered as one ZIP with a hash manifest inside."
+    )
 
     batch_files = st.file_uploader(
         "Report files",
@@ -1905,13 +2127,41 @@ with tab_batch:
         accept_multiple_files=True,
         key="batch_files",
     )
-    bulk_text = st.text_area("…or paste multiple reports, separated by a line of ---", height=200)
+    sheet_col, sample_col = st.columns([3, 1])
+    with sheet_col:
+        sheet_file = st.file_uploader(
+            "…or a spreadsheet — one report per row",
+            type=["csv", "xlsx"],
+            key="batch_sheet",
+            help="Columns (any casing): Raw_Dictation_Text (required), plus "
+                 "Patient_Name, Age_Sex, Study_Name, Patient_ID. The metadata "
+                 "becomes the report's own headings.",
+        )
+    with sample_col:
+        st.write("")
+        st.download_button(
+            ":material/description: Sample CSV",
+            data=("Patient_Name,Age_Sex,Study_Name,Patient_ID,Raw_Dictation_Text\n"
+                  "Anita Sharma,40Y/F,USG Abdomen,MRN001,\"FINDINGS:\n"
+                  "Liver is normal in size and echotexture.\n\nIMPRESSION:\n"
+                  "Normal study.\"\n"),
+            file_name="batch_template.csv",
+            mime="text/csv",
+            width="stretch",
+            help="The columns this tab understands — hand it to whoever "
+                 "prepares the sheet.",
+        )
+    bulk_text = st.text_area("…or paste multiple reports, separated by a line of ---",
+                             height=200)
 
-    jobs: list[tuple[str, str]] = []  # (label, raw_text)
+    items: list[batch_engine.BatchItem] = []
 
     for file in batch_files or []:
         try:
-            jobs.append((file.name, readers.read_any(file.name, file.getvalue())))
+            items.append(batch_engine.BatchItem(
+                label=file.name,
+                text=readers.read_any(file.name, file.getvalue()),
+            ))
         except readers.NeedsOCR as exc:
             st.warning(f"{file.name}: {exc} Use the Single report tab with AI OCR.")
         except readers.UnreadableFile as exc:
@@ -1919,54 +2169,166 @@ with tab_batch:
         except Exception as exc:
             st.warning(f"{file.name}: could not read ({exc}).")
 
-    if bulk_text.strip():
-        chunks = [c.strip() for c in re.split(r"^\s*-{3,}\s*$", bulk_text, flags=re.M) if c.strip()]
-        jobs.extend((f"pasted_{i + 1}", chunk) for i, chunk in enumerate(chunks))
+    if sheet_file is not None:
+        try:
+            if sheet_file.name.lower().endswith(".xlsx"):
+                sheet_items = batch_engine.from_xlsx(sheet_file.getvalue())
+            else:
+                sheet_items = batch_engine.from_csv(sheet_file.getvalue())
+            items.extend(sheet_items)
+            st.caption(f"{len(sheet_items)} report(s) read from {sheet_file.name}.")
+        except ValueError as exc:
+            st.error(str(exc))
 
-    if jobs and st.button(f"Convert {len(jobs)} report(s)", type="primary"):
-        buf = io.BytesIO()
-        rows = []
-        progress = st.progress(0.0)
+    for i, chunk in enumerate(batch_engine.split_pasted(bulk_text)):
+        items.append(batch_engine.BatchItem(label=f"pasted_{i + 1}", text=chunk))
 
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for i, (label, text) in enumerate(jobs, start=1):
-                blocks, _warnings, engine_used = make_blocks(text)
-                docx_bytes = build_docx(blocks, template=template, letterhead=letterhead, page_numbers=page_numbers)
-                title = next((b.text for b in blocks if b.kind == "title"), label)
-                name = safe_filename(title)
-                # Keep every file distinct even when two reports share a title.
-                if name in zf.namelist():
-                    name = name.replace(".docx", f"_{i}.docx")
-                zf.writestr(name, docx_bytes)
-
-                check = audit(text, docx_bytes, letterhead_text=letterhead_text, page_numbers=page_numbers,
-                    preserve_as_is=opts.preserve_as_is)
-                rows.append(
-                    {
-                        "source": label,
-                        "output": name,
-                        "engine": engine_used,
-                        "audit": "PASS" if check.ok else "FAIL",
-                        "words": check.source_tokens,
-                        "detail": "" if check.ok else check.summary,
-                    }
-                )
-                progress.progress(i / len(jobs))
-
-        failures = sum(1 for r in rows if r["audit"] == "FAIL")
-        if failures:
-            st.error(f"{failures} of {len(rows)} report(s) failed the word-loss audit - see the table.")
-        else:
-            st.success(f"All {len(rows)} report(s) converted, audit passed.")
-
-        st.dataframe(rows, width="stretch", hide_index=True)
-        st.download_button(
-            ":material/folder_zip: Download all as ZIP",
-            data=buf.getvalue(),
-            file_name=f"HC_Format_Reports_{datetime.now():%Y%m%d_%H%M}.zip",
-            mime="application/zip",
-            type="primary",
+    routable = [t for t in all_templates.values()
+                if (t.doctor or "").strip() and not t.builtin]
+    auto_route = False
+    if len(routable) >= 1:
+        auto_route = st.checkbox(
+            f"Route each report to its own doctor's template automatically "
+            f"({len(routable)} doctor template(s) available)",
+            value=len(routable) > 1,
+            help="The doctor whose name appears in a report (checked in the "
+                 "signature zone first) gets their template applied. No match, "
+                 "or an ambiguous one, falls back to the template selected in "
+                 "the Report tab — and the table says which happened.",
         )
+
+    if items and st.button(f"Process {len(items)} report(s)", type="primary"):
+        results: list[batch_engine.BatchResult] = []
+        progress = st.progress(0.0, text=f"Processing 0/{len(items)} reports…")
+        for i, item in enumerate(items, start=1):
+            routed_template, routed_how = (
+                batch_engine.route_template(item.text, all_templates, template)
+                if auto_route else (template, "selected template")
+            )
+            results.append(batch_engine.process_one(
+                item.label, item.text, routed_template,
+                letterhead=letterhead, page_numbers=page_numbers,
+                letterhead_text=letterhead_text, opts=opts,
+                blocks_builder=lambda t: make_blocks(t)[0],
+                routed=routed_how,
+            ))
+            progress.progress(i / len(items),
+                              text=f"Processing {i}/{len(items)} reports…")
+        st.session_state["batch_results"] = results
+
+    results = st.session_state.get("batch_results") or []
+    if results:
+        ready = sum(1 for r in results if r.ready)
+        failed_audit = sum(1 for r in results if not r.audit_ok and not r.error)
+        errored = sum(1 for r in results if r.error)
+        with_critical = sum(1 for r in results if r.qc_critical)
+
+        if ready == len(results):
+            st.success(f"All {len(results)} report(s) ready — audit passed, "
+                       "no critical QC findings.")
+        else:
+            st.warning(
+                f"{ready} ready · {with_critical} with critical QC findings · "
+                f"{failed_audit} failed the word-loss audit · {errored} errored. "
+                "Review the table before sending anything out."
+            )
+
+        st.dataframe(
+            [{
+                "Report": r.title or r.label,
+                "Patient": r.patient or "—",
+                "Modality": r.modality or "—",
+                "Template": r.template_name
+                            + ("" if r.routed.startswith("selected") else " ✦"),
+                "Audit": ("💥 error" if r.error
+                          else "✅ 100% retained" if r.audit_ok else "❌ words lost"),
+                "QC alerts": ("; ".join(r.qc_critical) if r.qc_critical
+                              else f"{r.qc_warnings} warning(s)" if r.qc_warnings
+                              else "none"),
+                "Urgency": URGENCY_BADGE.get(r.urgency, r.urgency),
+                "Status": "Ready" if r.ready else "Review",
+            } for r in results],
+            width="stretch", hide_index=True,
+        )
+        if auto_route and any(not r.routed.startswith("selected") for r in results):
+            with st.expander("How each report was routed"):
+                for r in results:
+                    st.caption(f"{r.title or r.label} — {r.routed}")
+        problems = [r for r in results if r.error or (not r.audit_ok and not r.error)]
+        if problems:
+            with st.expander(f"What went wrong ({len(problems)})"):
+                for r in problems:
+                    st.markdown(f"**{r.title or r.label}** — "
+                                f"{r.error or r.audit_summary}")
+
+        zip_col, manifest_col, wl_col, clear_col = st.columns([1.6, 1.1, 1.4, 0.9])
+        with zip_col:
+            st.download_button(
+                ":material/folder_zip: Download ZIP",
+                data=batch_engine.zip_bytes(results),
+                file_name=f"HC_Format_Reports_{datetime.now():%Y%m%d_%H%M}.zip",
+                mime="application/zip",
+                type="primary",
+                width="stretch",
+                help="Every .docx plus batch_audit_manifest.csv: per report, "
+                     "the SHA-256 of the source text and of the .docx, the "
+                     "audit verdict, QC counts and the timestamp — the "
+                     "medico-legal record that nothing changed after "
+                     "generation.",
+            )
+        with manifest_col:
+            st.download_button(
+                ":material/receipt_long: Manifest only",
+                data=batch_engine.manifest_csv(results),
+                file_name="batch_audit_manifest.csv",
+                mime="text/csv",
+                width="stretch",
+                help="Just the audit CSV, for a quick look in Excel.",
+            )
+        with wl_col:
+            ready_results = [r for r in results if r.ready]
+            if st.button(
+                f":material/playlist_add: Worklist ({len(ready_results)})",
+                width="stretch",
+                disabled=not ready_results
+                or st.session_state.get("batch_saved_to_worklist"),
+                help="Saves every READY report as a draft on the Worklist tab — "
+                     "signing, delivery, HL7 export and patient history all "
+                     "start there. Reports needing review are left out.",
+            ):
+                try:
+                    for r in ready_results:
+                        parsed_batch = parse_report(r.text, opts)
+                        rec = records.new_record(r.text, parsed_batch.blocks,
+                                                 source="batch")
+                        records.save(rec)
+                    st.session_state["batch_saved_to_worklist"] = True
+                    st.success(f"{len(ready_results)} report(s) are on the "
+                               "Worklist tab.")
+                except AttributeError:
+                    stale_modules_banner()
+        with clear_col:
+            if st.button(":material/backspace: Clear", width="stretch",
+                         key="batch_clear",
+                         help="Drop these results and start a fresh batch."):
+                st.session_state.pop("batch_results", None)
+                st.session_state.pop("batch_saved_to_worklist", None)
+                st.rerun()
+
+        good = [r for r in results if r.docx]
+        if good:
+            with st.expander(f"Download individual reports ({len(good)})"):
+                for i, r in enumerate(good):
+                    one_col, _pad = st.columns([2, 3])
+                    with one_col:
+                        st.download_button(
+                            f":material/download: {r.title or r.label}",
+                            data=r.docx,
+                            file_name=batch_engine.safe_filename(r.title or r.label),
+                            mime=DOCX_MIME,
+                            key=f"batch_one_{i}",
+                            width="stretch",
+                        )
 
 
 # ------------------------------- Rules ------------------------------------- #
@@ -2023,22 +2385,55 @@ with tab_dictate:
         ai4b_remote_code = False
 
         with st.expander("Speech engine", expanded=False):
-            if speech is None:
-                st.warning(
-                    "The AI4Bharat speech options could not load, so dictation is running on "
-                    f"Gemini only. Underlying error: `{SPEECH_IMPORT_ERROR}`"
-                )
+            import stt
+
+            # Configured fast providers (Sarvam, ElevenLabs, any OpenAI-
+            # compatible endpoint) appear alongside the built-in engines,
+            # each in two flavours: raw, and + Gemini layout.
+            stt_available = stt.available()
+            engine_options: dict[str, str] = {}
+            for provider_id, label in stt_available.items():
+                engine_options[f"stt:{provider_id}+gemini"] = \
+                    f"{label} + Gemini layout"
+                engine_options[f"stt:{provider_id}"] = f"{label} — raw text"
+            if speech is not None:
+                engine_options.update(speech.ENGINES)
             else:
-                engine_key = st.radio(
-                    "Who does the listening?",
-                    list(speech.ENGINES),
-                    format_func=lambda k: speech.ENGINES[k],
-                    key="dict_engine",
-                    help="AI4Bharat is IIT Madras's Indic speech recognition, trained on Indian "
-                         "speech across 22 languages. It hears Indian accents and Hindi/English "
-                         "mixing far better than a general model, but returns bare words — so "
-                         "pairing it with Gemini for the layout is usually the best setting.",
+                engine_options["gemini"] = "Gemini — hears and lays out in one pass"
+                st.warning(
+                    "The AI4Bharat speech options could not load. "
+                    f"Underlying error: `{SPEECH_IMPORT_ERROR}`"
                 )
+
+            engine_key = st.radio(
+                "Who does the listening?",
+                list(engine_options),
+                format_func=lambda k: engine_options[k],
+                key="dict_engine",
+                help="The fast hosted engines (Sarvam, ElevenLabs, your own "
+                     "endpoint) answer in about a second and appear here the "
+                     "moment their key is in secrets. AI4Bharat is IIT Madras's "
+                     "Indic ASR — best acoustics for Indian accents, but the "
+                     "hosted tier cold-starts slowly. Pairing any listener with "
+                     "Gemini for the layout is usually the best setting.",
+            )
+            if not stt_available:
+                st.caption(
+                    "Faster engines plug in via secrets: `SARVAM_API_KEY` "
+                    "(Saarika — best for Indian dictation), `ELEVENLABS_API_KEY` "
+                    "(Scribe), or `CUSTOM_STT_URL` for any OpenAI-compatible "
+                    "endpoint (Groq Whisper, a local faster-whisper server...). "
+                    "See secrets.toml.example."
+                )
+
+            stt_language = ""
+            if engine_key.startswith("stt:"):
+                stt_language = st.text_input(
+                    "Language code (optional — blank lets the engine detect, "
+                    "which handles Hindi/English mixing best)",
+                    key="dict_stt_lang",
+                    placeholder="hi, en, te ...",
+                ).strip()
 
             if speech is not None and engine_key.startswith("ai4bharat"):
                 c1, c2 = st.columns(2)
@@ -2134,7 +2529,35 @@ with tab_dictate:
                 result = None
 
                 try:
-                    if engine_key == "gemini":
+                    if engine_key.startswith("stt:"):
+                        import stt
+
+                        provider_id = engine_key[4:].removesuffix("+gemini")
+                        with st.spinner("Transcribing..."):
+                            heard_fast = stt.transcribe(
+                                provider_id, raw_audio, mime,
+                                language=st.session_state.get("dict_stt_lang", "").strip(),
+                            )
+                        st.session_state["dict_asr_text"] = heard_fast.text
+                        st.caption(heard_fast.note)
+
+                        if engine_key.endswith("+gemini"):
+                            with st.spinner("Laying it out as a report..."):
+                                result = ai_parser.structure_dictation(
+                                    heard_fast.text, template, api_key, model_choice,
+                                    context=study,
+                                    language=heard_fast.language,
+                                )
+                        else:
+                            result = {
+                                "transcript": heard_fast.text,
+                                "unclear": [],
+                                "audio_quality": "good",
+                                "notes": f"Raw {heard_fast.provider} output — no "
+                                         "layout was applied, and nothing was "
+                                         "checked for uncertainty.",
+                            }
+                    elif engine_key == "gemini":
                         with st.spinner("Transcribing what you said..."):
                             result = ai_parser.transcribe_dictation(
                                 raw_audio, mime, template, api_key, model_choice, context=study
@@ -2201,7 +2624,7 @@ with tab_dictate:
                     st.session_state["dict_original"] = result["transcript"]
                     st.session_state["dict_live_text"] = session.get("text", "")
                     st.rerun()
-                except SpeechError as exc:
+                except (SpeechError, stt.SttError) as exc:
                     st.error(str(exc))
                 except Exception as exc:
                     st.error(f"Transcription failed: {exc}")
@@ -2209,7 +2632,7 @@ with tab_dictate:
         if st.session_state.get("dict_result"):
             rough = {
                 "Browser live preview": st.session_state.get("dict_live_text", ""),
-                "AI4Bharat raw output": st.session_state.get("dict_asr_text", ""),
+                "ASR raw output": st.session_state.get("dict_asr_text", ""),
             }
             rough = {k: v for k, v in rough.items() if v}
             if rough:

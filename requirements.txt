@@ -28,6 +28,14 @@ opencv-python-headless>=4.8
 # text path works without it.
 pdfplumber>=0.11
 
+# Multipart uploads to the pluggable STT providers (stt.py). Streamlit pulls
+# this in anyway; pinned here so the Docker image never loses it by accident.
+requests>=2.31
+
+# Excel intake on the Batch tab (one report per spreadsheet row). CSV works
+# without it.
+openpyxl>=3.1
+
 # Free local OCR tier. Needs the tesseract binary too: packages.txt installs
 # tesseract-ocr on Streamlit Cloud; Windows uses the UB Mannheim installer.
 # The app degrades to Gemini Vision when either piece is absent.
