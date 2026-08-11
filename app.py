@@ -23,6 +23,7 @@ import streamlit.components.v1 as components
 
 import access
 import anatomy
+import crypto
 import deid
 import dicom_meta
 import dictation_fix
@@ -62,6 +63,72 @@ except Exception as _speech_exc:  # pragma: no cover - only on a broken install
 st.set_page_config(page_title="HC Format Radiology Report Generator", layout="wide", page_icon=":material/clinical_notes:")
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def _typography() -> None:
+    """
+    Reading rules the theme cannot express.
+
+    The one that matters clinically is `tabular-nums`. In a proportional font a
+    "1" is narrower than a "7", so a column of measurements shifts left and
+    right down the page and a misread digit is a misread measurement. Tabular
+    figures give every digit the same width, so 12 mm and 17 mm line up and a
+    changed number is visible at a glance.
+
+    The rest is ordinary typesetting: headings tighten as they grow (large text
+    set at body tracking looks loose), body copy gets the line height long
+    clinical paragraphs need, and captions stop competing with the text above
+    them. Selectors are Streamlit's stable data-testid hooks, and every rule is
+    type-only - no layout, so a Streamlit upgrade that renames a wrapper costs
+    appearance, never usability.
+    """
+    st.markdown(
+        """
+        <style>
+          h1, h2, h3, h4, h5 { letter-spacing: -0.021em; }
+          h1 { font-weight: 680; letter-spacing: -0.028em; line-height: 1.15; }
+          h2 { font-weight: 660; }
+          h3, h4 { font-weight: 640; }
+
+          [data-testid="stMarkdownContainer"] p,
+          [data-testid="stMarkdownContainer"] li { line-height: 1.62; }
+
+          /* Report text, measurements and every audit table: fixed-width
+             digits, so numbers can be compared down a column. */
+          [data-testid="stMarkdownContainer"],
+          [data-testid="stMetricValue"],
+          [data-testid="stDataFrame"],
+          .stTextArea textarea,
+          .stTextInput input,
+          code, pre { font-variant-numeric: tabular-nums; }
+
+          .stTextArea textarea { line-height: 1.6; }
+
+          /* A caption is a footnote, not a second voice. */
+          [data-testid="stCaptionContainer"] { line-height: 1.5; opacity: 0.86; }
+
+          [data-testid="stSidebar"] h2,
+          [data-testid="stSidebar"] h3 {
+              font-size: 0.95rem; font-weight: 660;
+              text-transform: uppercase; letter-spacing: 0.055em;
+          }
+
+          /* Three buttons share the sidebar's width; at this size the label
+             wraps under its own icon and the row looks broken. Keep icon and
+             label on one line. */
+          [data-testid="stSidebar"] button p { white-space: nowrap; font-size: 0.9rem; }
+          [data-testid="stSidebar"] button > div { flex-wrap: nowrap; }
+
+          [data-testid="stTabs"] button[role="tab"] p {
+              font-size: 0.97rem; font-weight: 570; letter-spacing: -0.005em;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+_typography()
 
 
 # --------------------------------------------------------------------------- #
@@ -530,6 +597,10 @@ with del_col:
     if st.button(":material/delete: Delete", width="stretch", help="Delete this template"):
         _dialog_delete(template)
 
+# The template manager renders here, under the buttons; its code stays with the
+# rest of the template machinery in the Templates tab section.
+tpl_manager_slot = st.sidebar.container()
+
 access.sign_out_control()
 
 if st.session_state.get("stale_modules"):
@@ -542,6 +613,24 @@ if st.session_state.get("stale_modules"):
 problem = storage.storage_problem()
 if problem:
     st.sidebar.error(problem, icon=":material/database_off:")
+
+# Which protections are actually on, said out loud. Every one of these fails
+# soft by design (no key = plaintext, no de-id = raw text to the cloud), so
+# absent this line the only way to notice was to go read the secrets.
+_shield_bits = [
+    "PHI encryption **on**" if crypto.enabled() else "PHI encryption off",
+    "cloud de-identification **on**" if deid.cloud_deid_enabled()
+    else "cloud de-identification off",
+    "signing key **on**" if verify.hmac_signature("probe") else "signing key off",
+]
+st.sidebar.caption(
+    ":material/shield: " + " · ".join(_shield_bits),
+    help="PHI encryption seals stored reports with PHI_KEY (AES-256-GCM). "
+         "Cloud de-identification (DEID_CLOUD) replaces names, MRNs and phone "
+         "numbers with placeholders before any text reaches Gemini. The "
+         "signing key (ATTEST_KEY) puts an HMAC signature on every signed "
+         "report and its attestation chain.",
+)
 
 st.sidebar.divider()
 st.sidebar.subheader("Parsing")
@@ -875,6 +964,23 @@ def render_audit(result, *, user_edited: bool = False,
                     "original context. Restore them by editing the lines above - "
                     "nothing is reinserted automatically."
                 )
+                # The repaired text on request, to read or copy from - never
+                # written into the document. Restoring stays the user's act.
+                if st.toggle(
+                    "Show the output text with these spans put back",
+                    key=f"reconcile_{hash(raw_text) & 0xFFFFFFFF}",
+                    help="Copy from this to fix the paste. The .docx itself "
+                         "is untouched.",
+                ):
+                    restored, applied, unplaced = verify.auto_reconcile(
+                        verify.docx_text(docx_bytes), plan)
+                    st.code(restored, language=None)
+                    if unplaced:
+                        st.warning(
+                            f"{len(unplaced)} span(s) had no unambiguous home "
+                            "and are NOT in the text above: "
+                            + "; ".join(f"“{u.text}”" for u in unplaced[:8])
+                        )
 
 
 def to_pdf(docx_bytes: bytes) -> bytes | None:
@@ -2150,6 +2256,87 @@ with tab_worklist:
                             st.success("The Report tab is prefilled — open it "
                                        "and add the findings.")
 
+    with st.expander(":material/travel_explore: DICOMweb (QIDO-RS / WADO-RS)",
+                     expanded=False):
+        if not pacs.dicomweb_config():
+            st.caption(
+                "The standards-based web way to search a PACS and fetch "
+                "images — works from the cloud, because the app dials out "
+                "over HTTPS. Set `DICOMWEB_URL` in secrets (an Orthanc's "
+                "`/dicom-web` root works; `DICOMWEB_USERNAME` / "
+                "`DICOMWEB_PASSWORD` if secured)."
+            )
+        else:
+            dw_name_col, dw_btn_col = st.columns([2.4, 1])
+            with dw_name_col:
+                dw_name = st.text_input(
+                    "Patient name filter (optional, e.g. SHARMA*)",
+                    key="dw_name",
+                )
+            with dw_btn_col:
+                st.write("")
+                if st.button(":material/search: Search studies",
+                             type="primary", width="stretch", key="dw_search"):
+                    try:
+                        st.session_state["dw_rows"] = pacs.qido_studies(
+                            limit=15, patient_name=dw_name.strip())
+                    except RuntimeError as exc:
+                        st.session_state.pop("dw_rows", None)
+                        st.error(str(exc))
+
+            dw_rows = st.session_state.get("dw_rows")
+            if dw_rows is not None and not dw_rows:
+                st.info("The server answered with no matching studies.")
+            for study in dw_rows or []:
+                uid = study.get("study_uid", "")
+                if not uid:
+                    continue
+                with st.container(border=True):
+                    st.markdown(
+                        f"**{study['patient'] or 'Unnamed'}** · "
+                        f"{study['sex'] or '?'} · "
+                        f"{study['modalities'] or '?'} · "
+                        f"{study['description'] or 'No description'} · "
+                        f"{study['study_date'] or '?'}"
+                    )
+                    dwc1, dwc2 = st.columns(2)
+                    with dwc1:
+                        if st.button("Fetch .dcm for cross-check",
+                                     key=f"dw_fetch_{uid}", width="stretch"):
+                            try:
+                                st.session_state[f"dw_file_{uid}"] = \
+                                    pacs.wado_first_instance(uid)
+                            except RuntimeError as exc:
+                                st.error(str(exc))
+                        fetched = st.session_state.get(f"dw_file_{uid}")
+                        if fetched:
+                            st.download_button(
+                                "Download .dcm", data=fetched,
+                                file_name=f"{uid[-12:]}.dcm",
+                                mime="application/dicom",
+                                key=f"dw_dl_{uid}", width="stretch",
+                                help="Drop it into the DICOM cross-check on "
+                                     "the Report tab.",
+                            )
+                    with dwc2:
+                        if st.button("Load preview", key=f"dw_prev_{uid}",
+                                     width="stretch"):
+                            try:
+                                dcm_bytes = (st.session_state.get(f"dw_file_{uid}")
+                                             or pacs.wado_first_instance(uid))
+                                st.session_state[f"dw_png_{uid}"] = \
+                                    pacs.to_png(dcm_bytes)
+                            except (RuntimeError, ValueError) as exc:
+                                st.error(str(exc))
+                        dw_png = st.session_state.get(f"dw_png_{uid}")
+                        if dw_png:
+                            st.image(dw_png, width=220)
+                            _prefill_from_image(
+                                dw_png, "image/png",
+                                study.get("description", ""),
+                                f"dw_job_{uid}", f"dw_preread_{uid}",
+                            )
+
 
 # ------------------------------- Batch ------------------------------------- #
 
@@ -3411,7 +3598,7 @@ with tab_templates:
                         )
                         st.rerun()
 
-    with st.expander(
+    with tpl_manager_slot.expander(
         f":material/folder_managed: Template manager ({len(template_names)})",
         expanded=False,
     ):
@@ -3451,7 +3638,9 @@ with tab_templates:
                         + (f" on {tpl.created_at[:10]}" if tpl.created_at else ""))
                 st.caption(" · ".join(detail_bits))
 
-                mg1, mg2, mg3, mg4 = st.columns(4)
+                # Sidebar is narrow: two rows of two, not one row of four.
+                mg1, mg2 = st.columns(2)
+                mg3, mg4 = st.columns(2)
                 with mg1:
                     if st.button(":material/edit: Edit", key=f"mgr_edit_{name}",
                                  width="stretch"):
@@ -3705,6 +3894,47 @@ with tab_templates:
                         if st.checkbox(term, value=True, key=f"tpl_vocab_{i}"):
                             kept_vocabulary.append(term)
 
+    with st.expander(f"Macros ({len(editing.macros or {})})"):
+        st.caption(
+            "Type a trigger like `.nchest` in any report box and it expands "
+            "into its full text. Saved on this doctor's template — changes "
+            "here apply immediately, no Save needed."
+        )
+        if editing.builtin:
+            st.caption("The built-in format holds no macros. Create a doctor's "
+                       "template to add some.")
+        else:
+            for trigger in sorted(editing.macros or {}):
+                mac_text, mac_del = st.columns([5, 1])
+                with mac_text:
+                    st.markdown(f"`{trigger}`")
+                    st.code(editing.macros[trigger][:600], language=None)
+                with mac_del:
+                    if st.button(":material/delete: Remove",
+                                 key=f"tpl_macro_del_{trigger}",
+                                 width="stretch"):
+                        templates.save(templates.forget_macro(editing, trigger))
+                        templates_changed()
+                        st.rerun()
+            new_trig_col, new_body_col = st.columns([1, 3])
+            with new_trig_col:
+                new_trigger = st.text_input("New trigger", key="tpl_macro_trig",
+                                            placeholder=".nchest")
+            with new_body_col:
+                new_body = st.text_area("Expands into", key="tpl_macro_body",
+                                        height=90,
+                                        placeholder="CHEST X-RAY REPORT\n\n"
+                                                    "FINDINGS:\n…")
+            if st.button(":material/add: Add macro", key="tpl_macro_add",
+                         disabled=not (new_trigger.strip() and new_body.strip())):
+                try:
+                    templates.save(templates.remember_macro(
+                        editing, new_trigger, new_body))
+                    templates_changed()
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+
     st.markdown("**Style examples** — past reports the AI learns this doctor's voice from")
     if editing.builtin:
         st.caption("The built-in format holds no examples. Create a doctor's template to add some.")
@@ -3831,6 +4061,37 @@ with tab_templates:
                 st.caption(
                     "No names against these rows because no identity provider is configured. "
                     "Set up `[auth]` in secrets.toml and Streamlit fills in who did what."
+                )
+
+        # The attestation chain, actually checked. Every audit writes a
+        # hash-chained record; recomputing the chain is what makes the log
+        # tamper-evident rather than just present.
+        import json as _json
+
+        attest_entries = []
+        for e in reversed(rows or []):  # events() is newest first
+            if e.kind == "audit.attest":
+                try:
+                    attest_entries.append(_json.loads(e.detail))
+                except Exception:
+                    attest_entries.append({})
+        if attest_entries:
+            status = verify.audit_chain_status(attest_entries)
+            if status["intact"] and not status["signed_bad"]:
+                signed_note = (f", {status['signed_ok']} signature(s) verified"
+                               if status["signed_ok"] else ", unsigned")
+                st.success(
+                    f"Attestation chain intact — {status['count']} record(s), "
+                    f"every link recomputed and matched{signed_note}."
+                )
+            else:
+                broken = ("a broken link at record "
+                          f"{status['first_break']}" if not status["intact"]
+                          else f"{status['signed_bad']} bad signature(s)")
+                st.error(
+                    f"Attestation chain FAILED verification: {broken}. "
+                    "Someone or something edited the audit log after the "
+                    "fact — treat the affected records as unproven."
                 )
 
     with st.expander("Preview this template on a sample report"):

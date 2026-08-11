@@ -388,6 +388,28 @@ def wado_instance(study_uid: str, series_uid: str, instance_uid: str) -> bytes:
     return _first_multipart_part(body)
 
 
+def wado_first_instance(study_uid: str) -> bytes:
+    """
+    The first instance of a study as .dcm bytes, from just the study UID.
+
+    QIDO study results carry no series/instance UIDs, so fetching anything
+    needed a second tool until now. One QIDO instance query fills the gap,
+    then the plain WADO-RS fetch above does the rest.
+    """
+    body = _dicomweb_request(
+        f"/studies/{urllib.parse.quote(study_uid)}/instances?limit=1",
+        "application/dicom+json",
+    )
+    entries = json.loads(body.decode("utf-8", "replace") or "[]")
+    if not entries or not isinstance(entries[0], dict):
+        raise RuntimeError("The study has no instances the server will list.")
+    series_uid = _qido_value(entries[0], "0020000E")
+    instance_uid = _qido_value(entries[0], "00080018")
+    if not series_uid or not instance_uid:
+        raise RuntimeError("The QIDO answer is missing series/instance UIDs.")
+    return wado_instance(study_uid, series_uid, instance_uid)
+
+
 def _first_multipart_part(body: bytes) -> bytes:
     """The payload of the first part of a multipart/related response."""
     if not body.startswith(b"--"):

@@ -302,6 +302,46 @@ def attestation(raw_text: str, docx_bytes: bytes, ok: bool,
     return record
 
 
+def audit_chain_status(entries: list[dict]) -> dict:
+    """
+    Recompute the attestation hash chain over audit-log entries, oldest first.
+
+    Each link is checked against its own recorded predecessor rather than the
+    recomputed one, so a single tampered record reads as ONE broken link, not
+    as everything after it - the report should point at the edit, not drown it.
+    Signatures are only counted when present: an unsigned chain is still
+    tamper-evident, just not tamper-proof.
+    """
+    import hashlib
+
+    first_break = None
+    previous = ""
+    signed_ok = 0
+    signed_bad = 0
+    for index, entry in enumerate(entries):
+        expected = hashlib.sha256(
+            f"{previous}|{entry.get('source_sha256', '')}"
+            f"|{entry.get('output_sha256', '')}"
+            f"|{entry.get('verdict', '')}".encode("ascii")
+        ).hexdigest()
+        if index and expected != entry.get("chain", "") and first_break is None:
+            first_break = index
+        signature = entry.get("signature", "")
+        if signature:
+            if verify_signature(entry.get("chain", ""), signature):
+                signed_ok += 1
+            else:
+                signed_bad += 1
+        previous = entry.get("chain", "")
+    return {
+        "count": len(entries),
+        "intact": first_break is None,
+        "first_break": first_break,
+        "signed_ok": signed_ok,
+        "signed_bad": signed_bad,
+    }
+
+
 def record_attestation(raw_text: str, docx_bytes: bytes, ok: bool,
                        subject: str = "") -> dict:
     """

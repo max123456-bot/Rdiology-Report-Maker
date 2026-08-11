@@ -1,22 +1,30 @@
 # Handoff
 
-State of the project as of `05e2c0d` (2026-08-11). Read this first in a new session.
+State of the project as of the audit/parity pass on 2026-08-11 (after
+`6e8eb14`). Read this first in a new session.
 
 ## Since the last handoff, in one paragraph
 
-Everything below in the architecture table was built and is live-verified:
-worklist + triage + lifecycle, PACS both ways (Orthanc/DICOMweb/MWL + C-STORE
-receiver), HL7 MLLP both ways, RBAC + PHI encryption + HMAC signatures,
-negation tripwire on every AI draft, pluggable STT (Sarvam/ElevenLabs/custom),
-the enterprise Batch tab with hash manifest, the anatomy tree, and the Draft
-tab's four generation modes (instructions / diagnosis-with-placeholders /
-rewrite / shorthand). Templates now carry categories (custom ones allowed),
-creation provenance, AI-designed skeletons-as-macros, and a full manager
-(filter/edit/duplicate/export/import/delete). Thirteen offline check suites;
-run them all with the command below. Deployment target moved to Render
-(Docker) - see DEPLOY.md; the old Streamlit Cloud app should be deleted once
-Render is verified. Still pending on the user: rotate credentials, make the
-repo private.
+A full audit-and-parity pass over the whole app. Security review found the
+code clean (parameterised SQL throughout, `yaml.safe_load`, no eval/exec/
+pickle, one benign `unsafe_allow_html` on a static docstring) and one real
+bug: a mistyped `STORAGE_URL` silently became a SQLite file named after the
+typo — `SqlStore` now refuses URLs without a `postgresql://`/`sqlite:///`
+scheme, and the stray `your-neon-string` file (empty, but committed) is
+untracked and gitignored. Backend features that never reached the UI now
+have one: a DICOMweb (QIDO-RS/WADO-RS) browser in the Worklist PACS section
+(with new `pacs.wado_first_instance`), a macro add/remove editor on the
+template editor, attestation-chain verification inside the Activity log
+(new `verify.audit_chain_status`), a sidebar protection-status line (PHI
+encryption / cloud de-id / signing key), and a show-restored-text toggle on
+the word-loss audit. The service API gained `/anatomy` and
+`/dictation-cleanup`. Typography was overhauled (system font stacks in
+`.streamlit/config.toml`, tabular numerals so measurements align, tighter
+heading tracking). The template manager moved into the sidebar under
+Doctor/template. Thirteen offline check suites, all green; run them with the
+command below. Deployment target is Render (Docker) - see DEPLOY.md; the old
+Streamlit Cloud app should be deleted once Render is verified. Still pending
+on the user: rotate credentials, make the repo private.
 
 ## What it is
 
@@ -71,7 +79,7 @@ for RIS integration, without touching the Streamlit UI.
 | `imgprep.py` | OpenCV scan clean-up (bilateral denoise, CLAHE, deskew, adaptive threshold) + hybrid OCR: free local Tesseract first, Gemini Vision only below the 85% confidence bar. |
 | `schemas.py` | Pydantic contract for structured outputs: `RadiologyReportSchema`, numbered `ImpressionItem`s with triage-set `is_critical`. |
 | `rules_schema.yaml` | Modality-specific validation rules (CT wants TECHNIQUE, mammography wants BI-RADS...) - edit the YAML, not the Python. |
-| `api.py` | FastAPI service layer over the offline engine. AI paths deliberately not exposed - nothing unreviewed leaves over HTTP. |
+| `api.py` | FastAPI service layer over the offline engine. AI paths deliberately not exposed - nothing unreviewed leaves over HTTP. Now also `/anatomy` (findings tree) and `/dictation-cleanup` (post-ASR ITN, suggestions advisory). |
 | `crypto.py` | PHI at rest: with `PHI_KEY`, report payloads are one AES-256-GCM sealed blob; only index columns stay plaintext, and `patient_key` becomes a keyed hash. Losing the key loses the records. |
 | `mllp.py` | HL7 over TCP: ORM^O01 order listener (orders become worklist drafts, LAN only) and ACK-gated ORU push (`MLLP_HOST`/`MLLP_PORT`). |
 | `deid.py` | De-identification before the cloud (`DEID_CLOUD`): known names, MRN/UHID, phones, emails, dates become placeholders; the model's answer is re-identified locally. |

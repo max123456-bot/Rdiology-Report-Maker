@@ -180,6 +180,55 @@ def _record_from(body: HL7In) -> dict:
     return record
 
 
+@app.post("/anatomy")
+async def anatomy_tree(body: ReportIn) -> dict:
+    """
+    The findings as a REGION → ORGAN → SUBPART tree with deterministic
+    coreference. A structured VIEW of the text - the text itself is untouched.
+    """
+    import anatomy
+
+    blocks = _blocks(body.text)
+    findings_text = "\n".join(
+        b.text for b in blocks
+        if (b.section or "").upper() in ("FINDINGS", "OBSERVATIONS")
+        and b.text.strip()
+    )
+    tree = anatomy.findings_tree(findings_text)
+    return {
+        "tree": tree,
+        "flat": [{"path": path, "sentence": sentence}
+                 for path, sentence in anatomy.flatten(tree)],
+    }
+
+
+class DictationIn(BaseModel):
+    text: str = Field(min_length=1)
+    vocabulary: list[str] = Field(default_factory=list)
+
+
+@app.post("/dictation-cleanup")
+async def dictation_cleanup(body: DictationIn) -> dict:
+    """
+    Deterministic post-ASR cleanup: spoken numbers to figures, units
+    normalised, medical notation joined. Suggestions are advisory only -
+    the same never-auto-apply rule as the UI.
+    """
+    import dictation_fix
+
+    result = dictation_fix.clean(body.text, body.vocabulary)
+    return {
+        "text": result.text,
+        "changed": result.changed,
+        "note": result.note,
+        "suggestions": [
+            {"heard": s.heard, "suggested": s.suggested,
+             "confidence": s.confidence, "reason": s.reason}
+            for s in (result.suggestions or [])
+        ],
+    }
+
+
 class MacroIn(BaseModel):
     text: str
     macros: Optional[dict[str, str]] = None

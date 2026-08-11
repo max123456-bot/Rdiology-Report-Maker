@@ -370,7 +370,20 @@ class SqlStore:
     reported rather than silently winning.
     """
 
+    # Only these open a database. Anything else is a typo, and a typo must not
+    # quietly become a database: sqlite3 creates whatever filename it is given,
+    # so a mistyped STORAGE_URL used to produce a file literally named
+    # "your-neon-string" while the clinic believed it was writing to Postgres.
+    # Nothing was backed up and nothing said a word. Refuse instead - get_store()
+    # turns the refusal into a visible banner and falls back to files.
+    SCHEMES = ("postgres://", "postgresql://", "sqlite:///")
+
     def __init__(self, url: str) -> None:
+        if not url.startswith(self.SCHEMES):
+            raise ValueError(
+                f"STORAGE_URL is not a database URL: {url!r}. It must start with "
+                "postgresql:// (a server) or sqlite:/// (a file)."
+            )
         self.url = url
         self.is_postgres = url.startswith(("postgres://", "postgresql://"))
         self._lock = threading.Lock()

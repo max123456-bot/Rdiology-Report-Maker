@@ -14,6 +14,8 @@ __pycache__/
 .venv/
 venv/
 .model_cache.json
+.ruff_cache/
+.pytest_cache/
 
 # Template backups
 templates/_backups/
@@ -23,7 +25,14 @@ data/
 *.db
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite3
 templates/_events.jsonl
+
+# A mistyped STORAGE_URL creates a SQLite file named after the placeholder
+# instead of connecting to Postgres. One reached a commit once.
+your-neon-string
+your-*-string
 
 # Backups pulled down from hosting
 backups/

@@ -130,6 +130,17 @@ attest = verify.attestation("src", b"docx", True)
 check("signature" in attest and verify.verify_signature(attest["chain"],
                                                         attest["signature"]),
       "the attestation chain is HMAC-signed when the key is present")
+
+link2 = verify.attestation("src2", b"docx2", False, previous_chain=attest["chain"])
+link3 = verify.attestation("src3", b"docx3", True, previous_chain=link2["chain"])
+status = verify.audit_chain_status([attest, link2, link3])
+check(status["intact"] and status["signed_ok"] == 3 and not status["signed_bad"],
+      "an untouched chain recomputes clean, every signature verified")
+tampered = dict(link2)
+tampered["verdict"] = "PASS"  # someone flips a FAIL after the fact
+status = verify.audit_chain_status([attest, tampered, link3])
+check(not status["intact"] and status["first_break"] == 1,
+      "flipping one verdict is caught at exactly that link")
 os.environ.pop("ATTEST_KEY", None)
 
 
@@ -302,6 +313,11 @@ QIDO_BODY = json.dumps([{
     "0020000D": {"vr": "UI", "Value": ["1.2.3.4"]},
 }]).encode()
 
+QIDO_INSTANCES_BODY = json.dumps([{
+    "0020000E": {"vr": "UI", "Value": ["1.2.3.4.1"]},
+    "00080018": {"vr": "UI", "Value": ["1.2.3.4.1.1"]},
+}]).encode()
+
 BOUNDARY = b"--BOUNDARY-X"
 DICOM_BYTES = b"DICM-fake-instance-bytes"
 WADO_BODY = (BOUNDARY + b"\r\nContent-Type: application/dicom\r\n\r\n"
@@ -312,6 +328,8 @@ class MockDicomWeb(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/dicom-web/studies?"):
             body, ctype = QIDO_BODY, "application/dicom+json"
+        elif "/instances?" in self.path:
+            body, ctype = QIDO_INSTANCES_BODY, "application/dicom+json"
         else:
             body, ctype = WADO_BODY, 'multipart/related; type="application/dicom"'
         self.send_response(200)
@@ -336,6 +354,9 @@ try:
     instance = pacs.wado_instance("1.2.3.4", "1.2.3.4.1", "1.2.3.4.1.1")
     check(instance == DICOM_BYTES,
           "WADO-RS extracts the DICOM part from the multipart body")
+    first = pacs.wado_first_instance("1.2.3.4")
+    check(first == DICOM_BYTES,
+          "wado_first_instance goes QIDO instances -> WADO from a study UID alone")
 finally:
     os.environ.pop("DICOMWEB_URL", None)
     httpd.shutdown()

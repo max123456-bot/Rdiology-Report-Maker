@@ -11,7 +11,16 @@ secondaryBackgroundColor = "#F5F9F9"
 textColor = "#12343B"
 linkColor = "#0F766E"
 codeBackgroundColor = "#F0FDFA"
-font = "sans-serif"
+
+# Fonts are named stacks, not web fonts, on purpose: a clinic PC may be
+# air-gapped, and a report must not wait on a CDN that will never answer.
+# Every family listed ships with Windows, macOS or a common Linux desktop; the
+# browser takes the first one it has.
+font = "\"Segoe UI Variable Text\", \"Segoe UI\", -apple-system, BlinkMacSystemFont, \"Inter\", Roboto, \"Helvetica Neue\", Arial, sans-serif"
+headingFont = "\"Segoe UI Variable Display\", \"Segoe UI Semibold\", \"Segoe UI\", -apple-system, BlinkMacSystemFont, \"Inter\", Roboto, \"Helvetica Neue\", Arial, sans-serif"
+codeFont = "\"Cascadia Mono\", \"JetBrains Mono\", Consolas, \"SF Mono\", \"Menlo\", \"DejaVu Sans Mono\", monospace"
+baseFontSize = 16
+
 baseRadius = "0.5rem"
 borderColor = "#D8E3E3"
 showWidgetBorder = true
