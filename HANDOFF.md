@@ -1,6 +1,22 @@
 # Handoff
 
-State of the project as of `bc998da`. Read this first in a new session.
+State of the project as of `05e2c0d` (2026-08-11). Read this first in a new session.
+
+## Since the last handoff, in one paragraph
+
+Everything below in the architecture table was built and is live-verified:
+worklist + triage + lifecycle, PACS both ways (Orthanc/DICOMweb/MWL + C-STORE
+receiver), HL7 MLLP both ways, RBAC + PHI encryption + HMAC signatures,
+negation tripwire on every AI draft, pluggable STT (Sarvam/ElevenLabs/custom),
+the enterprise Batch tab with hash manifest, the anatomy tree, and the Draft
+tab's four generation modes (instructions / diagnosis-with-placeholders /
+rewrite / shorthand). Templates now carry categories (custom ones allowed),
+creation provenance, AI-designed skeletons-as-macros, and a full manager
+(filter/edit/duplicate/export/import/delete). Thirteen offline check suites;
+run them all with the command below. Deployment target moved to Render
+(Docker) - see DEPLOY.md; the old Streamlit Cloud app should be deleted once
+Render is verified. Still pending on the user: rotate credentials, make the
+repo private.
 
 ## What it is
 
