@@ -387,6 +387,13 @@ check("IMPRESSION ONLY" in scope_prompt and "No findings section" in scope_promp
 scope_prompt = ai_parser.build_draft_prompt(
     _tpl, "notes", "shorthand expansion only - expand the abbreviations")
 check("do not restyle" in scope_prompt, "the shorthand scope forbids restyling")
+scope_prompt = ai_parser.build_draft_prompt(
+    _tpl, "Normal USG abdomen, 40F, grade I fatty liver, rest normal",
+    "a full report from my instructions")
+check("GENERATE FROM INSTRUCTIONS" in scope_prompt
+      and "never invent" in scope_prompt
+      and "THE RADIOLOGIST'S INSTRUCTIONS" in scope_prompt,
+      "the instructions scope generates a full report and forbids invention")
 
 started = time.perf_counter()
 points = ai_parser.draft_impression_from_findings(

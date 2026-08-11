@@ -2942,23 +2942,34 @@ with tab_draft:
         in_col, out_col = st.columns(2, gap="large")
 
         with in_col:
-            st.markdown("**Rough notes**")
+            st.markdown("**Doctor's prompt**")
             section = st.selectbox(
-                "Rewrite",
-                ["the IMPRESSION only", "the FINDINGS only", "the whole report",
+                "What should the AI do with it?",
+                ["a full report from my instructions",
+                 "the whole report", "the FINDINGS only", "the IMPRESSION only",
                  "shorthand expansion only - expand the abbreviations verbatim, "
                  "keep my wording and order exactly as written"],
                 format_func=lambda s: s.split(" - ")[0],
-                help="Narrower is safer. The IMPRESSION is where house style shows "
-                     "most. *Shorthand expansion only* just spells things out - "
-                     "no restyling at all.",
+                help="**From my instructions**: tell the AI what report you want "
+                     "('Normal USG abdomen, 40F, grade I fatty liver, rest normal') "
+                     "and it writes the whole thing - stated facts only, standard "
+                     "normal phrases for the rest. The other modes REWRITE your "
+                     "shorthand notes instead of generating; narrower is safer, "
+                     "and *shorthand expansion* restyles nothing.",
             )
+            instruction_mode = section.startswith("a full report")
             rough = st.text_area(
-                "Rough notes — shorthand is fine",
+                "Doctor's prompt",
                 value=st.session_state.get("draft_in", ""),
                 height=220,
                 label_visibility="collapsed",
-                placeholder="mult gallstones 4-11mm, no chole\nliver 14.2cm normal, no SOL\nkidneys nad",
+                placeholder=(
+                    "USG abdomen for a 40 year old female.\n"
+                    "Grade I fatty liver. Multiple gallstones 4-11 mm, no "
+                    "cholecystitis.\nEverything else normal. My usual format."
+                    if instruction_mode else
+                    "mult gallstones 4-11mm, no chole\nliver 14.2cm normal, no SOL\nkidneys nad"
+                ),
             )
 
         def run_draft(notes: str, answers: dict) -> None:
@@ -3093,7 +3104,7 @@ with tab_draft:
                     )
                 elif omissions:
                     st.warning(
-                        "🟡 Negatives from your notes not mentioned in the draft: "
+                        "🟡 Negatives from your prompt not mentioned in the draft: "
                         + ", ".join(f"“no {o}”" for o in omissions)
                         + ". Often fine in a summary — confirm it is deliberate."
                     )
@@ -3109,16 +3120,20 @@ with tab_draft:
                     dropped = []
                 if dropped:
                     st.error(
-                        "🔴 **Numbers from your notes missing from the draft**: "
+                        "🔴 **Numbers from your prompt missing from the draft**: "
                         + ", ".join(dropped)
                         + ". Check nothing was lost or altered before using it."
                     )
                 else:
                     st.success("🟢 Measurements preserved — every number from your "
-                               "notes appears in the draft.")
+                               "prompt appears in the draft.")
                     st.caption(
                         "The badges check polarity and numbers. Whether a finding "
                         "was reworded correctly is your read."
+                        + (" In instructions mode the AI adds standard normal "
+                           "descriptions by design — the badges only guarantee "
+                           "that YOUR stated numbers and negations survived."
+                           if instruction_mode else "")
                     )
 
                 # -------- teach -------- #

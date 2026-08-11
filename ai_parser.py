@@ -139,7 +139,21 @@ def build_draft_prompt(
     # label, a model handed three lines of shorthand happily returns an
     # impression when the whole report was asked for.
     scope = (section or "").lower()
-    if "whole report" in scope:
+    if "instruction" in scope:
+        parts.append(
+            "\nSCOPE - GENERATE FROM INSTRUCTIONS. The text below is the "
+            "radiologist's INSTRUCTIONS for the report they want - not findings "
+            "to rewrite. Produce the complete report they describe:\n"
+            "- a study title line, FINDINGS: organ by organ, then IMPRESSION:\n"
+            "- abnormalities, measurements and lateralities: ONLY the ones the "
+            "instructions state - never invent one\n"
+            "- organs the instructions call normal, and the remaining organs a "
+            "standard template for that study routinely covers, get the standard "
+            "normal descriptions\n"
+            "- anything negated in the instructions ('no hydronephrosis') stays "
+            "negated in the report"
+        )
+    elif "whole report" in scope:
         parts.append(
             "\nSCOPE - THE WHOLE REPORT. Produce a complete structured report:\n"
             "- a study title line (infer the study from the notes, e.g. USG ABDOMEN REPORT)\n"
@@ -165,8 +179,10 @@ def build_draft_prompt(
             "restyle, do not reorganise, do not add headings that are not there."
         )
 
+    marker = ("THE RADIOLOGIST'S INSTRUCTIONS" if "instruction" in scope
+              else f"ROUGH NOTES TO REWRITE ({section})")
     parts.append(
-        f"\n--- ROUGH NOTES TO REWRITE ({section}) ---\n{raw_notes.strip()}"
+        f"\n--- {marker} ---\n{raw_notes.strip()}"
         f"\n\n--- {doctor.upper()}'S VERSION ---"
     )
     return "\n".join(parts)
