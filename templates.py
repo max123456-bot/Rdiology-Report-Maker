@@ -75,10 +75,22 @@ class Correction:
     when: str = ""
 
 
+# What kind of study a template is for. Filters the pickers, groups the
+# Templates tab, and names the study family a doctor built the template for.
+CATEGORIES = ("General", "USG", "CT", "MRI", "X-Ray", "Mammography",
+              "Doppler", "Fluoroscopy", "Nuclear")
+
+
 @dataclass
 class Template:
     name: str = "HC FORMAT (default)"
     doctor: str = ""
+    # Which study family this template is for (one of CATEGORIES), and who
+    # made it, when - so a clinic with thirty templates can tell "Dr. Sharma's
+    # CT brain" from "Dr. Sharma's MRI spine" at a glance.
+    category: str = "General"
+    created_by: str = ""
+    created_at: str = ""
     font_name: str = "Arial"
     font_size: float = 12.0
     font_color: str = "000000"
@@ -301,6 +313,11 @@ def from_dict(data: dict) -> Template:
     return Template(
         name=str(fields.get("name") or "Untitled template").strip() or "Untitled template",
         doctor=str(fields.get("doctor") or "").strip(),
+        category=(str(fields.get("category") or "General").strip()
+                  if str(fields.get("category") or "").strip() in CATEGORIES
+                  else "General"),
+        created_by=str(fields.get("created_by") or "").strip(),
+        created_at=str(fields.get("created_at") or "").strip(),
         font_name=str(fields.get("font_name") or "Arial").strip() or "Arial",
         font_size=_num(fields.get("font_size"), 12.0, 4, 96),
         font_color=(str(fields.get("font_color") or "000000").lstrip("#").strip() or "000000"),
@@ -586,6 +603,27 @@ def expand_macros(text: str, template: Template | None = None) -> tuple[str, lis
         return match.group(0)
 
     return _MACRO_TRIGGER.sub(replace, text), used
+
+
+def macro_trigger(name: str) -> str:
+    """
+    A macro trigger derived from a template's name: "Dr. Sharma CT Brain" ->
+    ".ctbrainsharma"-ish is unreadable, so keep it simple: lowercase letters
+    and digits of the name, dot-prefixed, capped. "MRI Brain" -> ".mribrain".
+    """
+    stem = re.sub(r"[^a-z0-9]", "", (name or "").lower())[:24]
+    return f".{stem or 'template'}"
+
+
+def stamp_creation(template: Template, created_by: str = "") -> Template:
+    """Record who made this template and when, once, at creation."""
+    from datetime import datetime, timezone
+
+    if not template.created_at:
+        template.created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    if created_by and not template.created_by:
+        template.created_by = created_by
+    return template
 
 
 def remember_macro(template: Template, trigger: str, body: str) -> Template:

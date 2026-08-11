@@ -1112,6 +1112,78 @@ def second_opinion(report_text: str, api_key: str, model: str) -> dict:
             "issues": issues}
 
 
+TEMPLATE_GEN_PROMPT = """You design radiology report TEMPLATES for a specific doctor's
+recurring use - the reusable skeleton, not one patient's report.
+
+From the doctor's description, produce:
+
+- "skeleton": the complete report skeleton for that study type - a title
+  line, the standard headings (CLINICAL HISTORY, TECHNIQUE where the study
+  warrants it, FINDINGS organ by organ / structure by structure for that
+  study, IMPRESSION), with the doctor's stated preferences applied. Wherever
+  a patient-specific value will go, write an ALL-CAPS bracketed placeholder
+  like [SIZE mm], [SIDE], [FINDING] - never a real value, never an invented
+  finding. Normal-by-default lines the doctor asked for are written out in
+  full standard phrases.
+- "style_notes": the doctor's stated preferences as short imperative house
+  rules the drafting AI will obey ("Number the impression", "Always include
+  a COMPARISON section", "Write calculi, not stones").
+- "signoff": the closing line(s) the doctor wants on every report, [] if
+  none were stated.
+
+Only what the description states or what is standard for the named study
+type. Never add clinical content of your own.
+
+Return JSON only:
+{"skeleton": "...", "style_notes": "...", "signoff": ["..."]}"""
+
+
+def build_template_prompt(description: str, category: str = "",
+                          doctor: str = "") -> str:
+    """The template-generation request. Pure text - testable offline."""
+    parts = []
+    if doctor.strip():
+        parts.append(f"Doctor: {doctor.strip()}")
+    if category.strip():
+        parts.append(f"Study family: {category.strip()}")
+    parts.append(f"--- THE DOCTOR'S DESCRIPTION OF THE TEMPLATE ---\n"
+                 f"{description.strip()}")
+    return "\n".join(parts)
+
+
+def generate_template(description: str, api_key: str, model: str,
+                      category: str = "", doctor: str = "") -> dict:
+    """
+    An AI-designed template from the doctor's description. Returns
+    {"skeleton": str, "style_notes": str, "signoff": [str]}. The caller shows
+    it for editing before anything is saved - nothing lands on disk unseen.
+    """
+    import json as _json
+
+    from google.genai import types
+
+    client = _client(api_key)
+    response = _generate(client,
+        model=model,
+        contents=[build_template_prompt(description, category, doctor)],
+        config=types.GenerateContentConfig(
+            system_instruction=TEMPLATE_GEN_PROMPT,
+            response_mime_type="application/json",
+            temperature=0.2,
+        ),
+    )
+    data = _json.loads(response.text or "{}")
+    skeleton = str(data.get("skeleton") or "").strip()
+    if not skeleton:
+        raise ValueError("The model returned no template skeleton.")
+    return {
+        "skeleton": skeleton,
+        "style_notes": str(data.get("style_notes") or "").strip(),
+        "signoff": [str(s).strip() for s in (data.get("signoff") or [])
+                    if str(s).strip()],
+    }
+
+
 def _blocks_from_json(payload: str) -> list[Block]:
     data: Any = json.loads(payload)
     if isinstance(data, dict):

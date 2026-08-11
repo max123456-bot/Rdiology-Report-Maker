@@ -435,8 +435,19 @@ def _dialog_seed_template(report_text: str, corrections: tuple[str, str] | None 
     """
     st.write("The report you just finished becomes this doctor's first voice sample.")
     base_name = st.selectbox("Formatting based on", template_names, key="seed_base")
-    name = st.text_input("Template name", placeholder="Dr. Sharad", key="seed_name")
-    doctor = st.text_input("Doctor", placeholder="Dr. Sharad Kulkarni", key="seed_doctor")
+    seed_a, seed_b = st.columns(2)
+    with seed_a:
+        name = st.text_input("Template name", placeholder="Dr. Sharad — CT",
+                             key="seed_name")
+        doctor = st.text_input("Doctor", placeholder="Dr. Sharad Kulkarni",
+                               key="seed_doctor")
+    with seed_b:
+        seed_category = st.selectbox(
+            "Category", templates.CATEGORIES, key="seed_category",
+            help="Which study family this template is for — MRI, CT, USG...",
+        )
+        st.caption(f"Created by **{storage.current_user() or doctor or 'you'}**, "
+                   "stamped with today's date.")
     notes = st.text_area(
         "Anything they always do (optional)",
         key="seed_notes",
@@ -453,11 +464,14 @@ def _dialog_seed_template(report_text: str, corrections: tuple[str, str] | None 
         else:
             fresh = templates.copy_of(all_templates[base_name], name.strip(), doctor.strip())
             fresh.style_notes = notes.strip()
+            fresh.category = seed_category
             # A brand new doctor inherits formatting, never another doctor's voice.
             fresh.examples, fresh.corrections, fresh.preferences, fresh.answered = [], [], [], {}
             fresh = templates.remember_example(fresh, report_text)
             if corrections and corrections[0].strip() != corrections[1].strip():
                 fresh = templates.remember_correction(fresh, corrections[0], corrections[1])
+            fresh = templates.stamp_creation(
+                fresh, created_by=storage.current_user() or doctor.strip())
             templates.save(fresh)
             templates_changed()
             st.session_state["tpl_pick"] = fresh.name
@@ -902,10 +916,16 @@ with tab_single:
             template_names,
             key="tpl_pick",
             format_func=lambda n: (
-                f"{n} — {all_templates[n].doctor}" if all_templates[n].doctor else n
+                n
+                + (f" — {all_templates[n].doctor}" if all_templates[n].doctor else "")
+                + (f" [{all_templates[n].category}]"
+                   if getattr(all_templates[n], "category", "General")
+                   not in ("", "General") else "")
             ),
-            help="Which doctor's house style this report comes out in. Manage them with "
-                 "New / Edit / Delete in the sidebar.",
+            help="Which doctor's house style this report comes out in — the "
+                 "[category] tag says which study family it was built for. "
+                 "Manage them with New / Edit / Delete in the sidebar, or design "
+                 "one with AI in the Templates tab.",
         )
         st.caption(template_summary(template))
     with src_col:
@@ -3280,6 +3300,100 @@ with tab_draft:
 with tab_templates:
     st.caption("One doctor's house style. Pick it in the sidebar; reports follow it automatically.")
 
+    with st.expander(":material/auto_awesome: AI-based template — describe it, "
+                     "get it, edit it, save it", expanded=False):
+        if not (use_ai and api_key and model_choice):
+            st.info("Switch the sidebar engine to **AI-assisted** (with a Gemini "
+                    "key) to design templates with AI.")
+        else:
+            st.caption(
+                "Describe the template you want — the study, the sections, your "
+                "habits — and the AI drafts the skeleton and your house rules. "
+                "You edit everything before saving. Patient values come out as "
+                "[PLACEHOLDERS]; the checks refuse to sign a report until every "
+                "one is filled."
+            )
+            g1, g2, g3 = st.columns([1.6, 1.2, 1])
+            with g1:
+                ait_name = st.text_input("Template name", key="ait_name",
+                                         placeholder="Dr. Sharma — CT Brain")
+            with g2:
+                ait_doctor = st.text_input("Doctor", key="ait_doctor",
+                                           placeholder="Dr. Sharma")
+            with g3:
+                ait_category = st.selectbox("Category", templates.CATEGORIES,
+                                            key="ait_category",
+                                            help="MRI / CT / USG... — groups "
+                                                 "the pickers and names the "
+                                                 "study family.")
+            ait_description = st.text_area(
+                "Describe your template",
+                key="ait_description", height=140,
+                placeholder="CT brain plain template. Always a CLINICAL HISTORY "
+                            "and COMPARISON section. Findings by structure: "
+                            "parenchyma, ventricles, posterior fossa, bones, "
+                            "sinuses. Numbered impression. Close with 'Please "
+                            "correlate clinically.'",
+            )
+            if st.button(":material/auto_awesome: Generate template with AI",
+                         type="primary", disabled=not ait_description.strip()):
+                try:
+                    import ai_parser
+
+                    with st.spinner("Designing the template..."):
+                        st.session_state["ait_result"] = ai_parser.generate_template(
+                            ait_description, api_key, model_choice,
+                            category=ait_category, doctor=ait_doctor,
+                        )
+                except Exception as exc:
+                    st.error(f"Template generation failed: {exc}")
+
+            ait_result = st.session_state.get("ait_result")
+            if ait_result:
+                st.markdown("**Skeleton** — this becomes a macro: type its "
+                            "trigger in any report box and it expands")
+                ait_skeleton = st.text_area(
+                    "Skeleton", value=ait_result["skeleton"], height=280,
+                    key="ait_skeleton", label_visibility="collapsed",
+                )
+                st.markdown("**House rules** — the drafting AI obeys these")
+                ait_notes = st.text_area(
+                    "House rules", value=ait_result["style_notes"], height=100,
+                    key="ait_notes", label_visibility="collapsed",
+                )
+                trigger_preview = templates.macro_trigger(
+                    ait_name or ait_category)
+                st.caption(f"Macro trigger will be **`{trigger_preview}`** · "
+                           f"category **{ait_category}** · created by "
+                           f"**{ait_doctor or storage.current_user() or 'you'}**")
+                if st.button(":material/save: Save this template",
+                             type="primary",
+                             disabled=not ait_name.strip()):
+                    if ait_name.strip() in all_templates:
+                        st.error(f"“{ait_name.strip()}” already exists — pick "
+                                 "another name.")
+                    else:
+                        fresh = templates.copy_of(templates.HC_FORMAT,
+                                                  ait_name.strip(),
+                                                  doctor=ait_doctor.strip())
+                        fresh.category = ait_category
+                        fresh.style_notes = ait_notes.strip()
+                        fresh.macros = {trigger_preview: ait_skeleton.strip()}
+                        fresh = templates.stamp_creation(
+                            fresh,
+                            created_by=(storage.current_user()
+                                        or ait_doctor.strip()))
+                        templates.save(fresh)
+                        templates_changed()
+                        st.session_state.pop("ait_result", None)
+                        st.session_state["tpl_pick"] = fresh.name
+                        st.success(
+                            f"Saved. Pick **{fresh.name}** anywhere, and type "
+                            f"`{trigger_preview}` in a report box to expand the "
+                            "skeleton."
+                        )
+                        st.rerun()
+
     editing_name = st.selectbox(
         "Edit template", template_names, index=template_names.index(picked_template),
         key="tpl_edit_pick",
@@ -3297,6 +3411,19 @@ with tab_templates:
         t_name = st.text_input("Template name", value=editing.name, key="tpl_name")
         t_doctor = st.text_input("Doctor", value=editing.doctor, key="tpl_doctor",
                                  placeholder="Dr. Sharad Kulkarni")
+        t_category = st.selectbox(
+            "Category", templates.CATEGORIES,
+            index=(templates.CATEGORIES.index(editing.category)
+                   if editing.category in templates.CATEGORIES else 0),
+            key="tpl_category",
+            help="Which study family this template is for — MRI, CT, USG... "
+                 "Shown in every picker so a doctor's CT and MRI templates "
+                 "stay tellable apart.",
+        )
+        if editing.created_at or editing.created_by:
+            st.caption("Created"
+                       + (f" by **{editing.created_by}**" if editing.created_by else "")
+                       + (f" on {editing.created_at[:10]}" if editing.created_at else ""))
         t_font = st.text_input("Font", value=editing.font_name, key="tpl_font")
         t_size = st.number_input("Font size (pt)", 6.0, 36.0, float(editing.font_size), 0.5,
                                  key="tpl_size")
@@ -3388,6 +3515,12 @@ with tab_templates:
             answered=kept_answers,
             vocabulary=kept_vocabulary,
             dictation_fixes=list(editing.dictation_fixes),
+            # Carried through an edit, not editable away: the macros, the
+            # category, and who created it when.
+            macros=dict(editing.macros or {}),
+            category=t_category,
+            created_by=editing.created_by,
+            created_at=editing.created_at,
         )
 
     st.markdown("**Learned from corrections** — rules the AI worked out from this doctor's edits")

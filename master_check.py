@@ -335,6 +335,30 @@ roundtrip = templates.from_dict(templates.to_dict(doctor))
 check(roundtrip.macros.get(".normalchest") == "My own normal chest text.",
       "macros survive the save/load round trip")
 
+cat_tpl = templates.copy_of(templates.HC_FORMAT, "Dr. S — CT Brain",
+                            doctor="Dr. Sharma")
+cat_tpl.category = "CT"
+cat_tpl = templates.stamp_creation(cat_tpl, created_by="dr.s@clinic.in")
+check(cat_tpl.created_at and cat_tpl.created_by == "dr.s@clinic.in",
+      "creation is stamped with who and when")
+cat_round = templates.from_dict(templates.to_dict(cat_tpl))
+check(cat_round.category == "CT" and cat_round.created_by == "dr.s@clinic.in"
+      and cat_round.created_at == cat_tpl.created_at,
+      "category and creation details survive the round trip")
+bad = templates.from_dict({**templates.to_dict(cat_tpl), "category": "Astrology"})
+check(bad.category == "General", "an unknown category falls back to General")
+check(templates.macro_trigger("Dr. S — CT Brain") == ".drsctbrain",
+      "the macro trigger derives from the name")
+
+import ai_parser as _ai_tpl  # noqa: E402
+
+tpl_prompt = _ai_tpl.build_template_prompt(
+    "CT brain, numbered impression, always a comparison section",
+    category="CT", doctor="Dr. Sharma")
+check("Study family: CT" in tpl_prompt and "Doctor: Dr. Sharma" in tpl_prompt
+      and "DOCTOR'S DESCRIPTION" in tpl_prompt,
+      "the template-generation prompt carries doctor, category and description")
+
 
 # --------------------------------------------------------------------------- #
 print("\nai_parser - retry wrapper and fast impression")
