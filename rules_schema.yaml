@@ -1,0 +1,36 @@
+# Modality-specific report rules for validate.py.
+#
+# Edit this file, not the Python: a clinic that wants CT reports to always
+# carry a TECHNIQUE section changes one line here. Severities are one of
+# note | warning | critical. Anything not listed inherits `default`.
+#
+# The modality is read from the report's title line (USG/CT/MRI/X-Ray...).
+# A report whose modality cannot be guessed only gets the default rules.
+
+default:
+  required_sections: []          # structure checks already demand IMPRESSION
+  recommended_sections: []
+  banned_phrases:
+    - phrase: "normal study"     # bare phrase with no organ detail
+      severity: note
+      why: "State what was examined and found normal - a bare 'normal study' is uninformative."
+
+modalities:
+  CT:
+    recommended_sections: [TECHNIQUE]
+    severity: note
+    why: "CT reports should state the technique - contrast, slice protocol."
+  MRI:
+    recommended_sections: [TECHNIQUE, "IMAGING SEQUENCES USED"]
+    severity: note
+    why: "MRI reports should state the sequences used."
+  USG:
+    recommended_sections: []
+  X-Ray:
+    recommended_sections: []
+  Mammography:
+    recommended_sections: []
+    required_phrases:
+      - phrase: "BI-RADS"
+        severity: warning
+        why: "A mammography report without a BI-RADS assessment category is incomplete."

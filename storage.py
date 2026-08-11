@@ -85,6 +85,16 @@ class Store(Protocol):
     def events(self, limit: int = 200) -> list[Event]: ...
     def describe(self) -> str: ...
 
+    # Report records - the worklist, the sign-off trail and the patient history
+    # live here. A record is a dict that carries its own "id"; the store also
+    # indexes "status", "patient_key" and "urgency" so the worklist can filter
+    # without loading every report ever written.
+    def save_report(self, tenant: str, record: dict) -> None: ...
+    def get_report(self, tenant: str, report_id: str) -> dict | None: ...
+    def list_reports(self, tenant: str, status: str | None = None,
+                     patient_key: str | None = None, limit: int = 200) -> list[dict]: ...
+    def delete_report(self, tenant: str, report_id: str) -> bool: ...
+
 
 # --------------------------------------------------------------------------- #
 # JSON files - the default
@@ -266,6 +276,72 @@ class FileStore:
             if os.path.isdir(os.path.join(self.root, d)) and not d.startswith("_")
         )
 
+    # -- report records ---------------------------------------------------- #
+
+    def _reports_dir(self, tenant: str) -> str:
+        return os.path.join(self.root, "_reports", clean_tenant(tenant))
+
+    def _report_path(self, tenant: str, report_id: str) -> str:
+        import re as _re
+
+        safe = _re.sub(r"[^a-z0-9-]", "", str(report_id).lower())[:64]
+        return os.path.join(self._reports_dir(tenant), f"{safe}.json")
+
+    def save_report(self, tenant: str, record: dict) -> None:
+        if not record.get("id"):
+            raise ValueError("A report record needs an id.")
+        with self._lock:
+            folder = self._reports_dir(tenant)
+            os.makedirs(folder, exist_ok=True)
+            target = self._report_path(tenant, record["id"])
+            tmp = target + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(record, fh, indent=2, ensure_ascii=False)
+            os.replace(tmp, target)
+
+    def get_report(self, tenant: str, report_id: str) -> dict | None:
+        path = self._report_path(tenant, report_id)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+
+    def list_reports(self, tenant: str, status: str | None = None,
+                     patient_key: str | None = None, limit: int = 200) -> list[dict]:
+        folder = self._reports_dir(tenant)
+        if not os.path.isdir(folder):
+            return []
+        rows: list[dict] = []
+        for filename in os.listdir(folder):
+            if not filename.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(folder, filename), encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except Exception:
+                continue  # one corrupt record must not hide the worklist
+            if not isinstance(payload, dict) or not payload.get("id"):
+                continue
+            if status and payload.get("status") != status:
+                continue
+            if patient_key and payload.get("patient_key") != patient_key:
+                continue
+            rows.append(payload)
+        rows.sort(key=lambda r: str(r.get("updated") or r.get("created") or ""), reverse=True)
+        return rows[:limit]
+
+    def delete_report(self, tenant: str, report_id: str) -> bool:
+        with self._lock:
+            path = self._report_path(tenant, report_id)
+            if os.path.exists(path):
+                os.remove(path)
+                return True
+            return False
+
     def describe(self) -> str:
         return f"JSON files in {os.path.basename(self.root)}/"
 
@@ -360,6 +436,24 @@ class SqlStore:
                     )"""
             )
             cur.execute("CREATE INDEX IF NOT EXISTS events_when ON events (when_)")
+            cur.execute(
+                f"""CREATE TABLE IF NOT EXISTS reports (
+                        tenant       TEXT NOT NULL DEFAULT 'default',
+                        id           TEXT NOT NULL,
+                        status       TEXT NOT NULL DEFAULT 'draft',
+                        urgency      TEXT NOT NULL DEFAULT 'routine',
+                        patient_key  TEXT NOT NULL DEFAULT '',
+                        payload      {json_type} NOT NULL,
+                        updated      TEXT NOT NULL,
+                        PRIMARY KEY (tenant, id)
+                    )"""
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS reports_status ON reports (tenant, status)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS reports_patient ON reports (tenant, patient_key)"
+            )
             if not self.is_postgres:
                 self._conn.commit()
 
@@ -519,6 +613,92 @@ class SqlStore:
             cur = self._conn.cursor()
             cur.execute("SELECT DISTINCT tenant FROM templates ORDER BY tenant")
             return [str(r[0]) for r in cur.fetchall()]
+
+    # -- report records ---------------------------------------------------- #
+
+    def save_report(self, tenant: str, record: dict) -> None:
+        report_id = str(record.get("id") or "")
+        if not report_id:
+            raise ValueError("A report record needs an id.")
+        tenant = clean_tenant(tenant)
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        status = str(record.get("status") or "draft")
+        urgency = str(record.get("urgency") or "routine")
+        patient_key = str(record.get("patient_key") or "")
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                f"SELECT 1 FROM reports WHERE tenant = {self._ph} AND id = {self._ph}",
+                (tenant, report_id),
+            )
+            if cur.fetchone() is None:
+                cur.execute(
+                    f"INSERT INTO reports (tenant, id, status, urgency, patient_key, "
+                    f"payload, updated) VALUES ({self._ph}, {self._ph}, {self._ph}, "
+                    f"{self._ph}, {self._ph}, {self._ph}, {self._ph})",
+                    (tenant, report_id, status, urgency, patient_key,
+                     self._dumps(record), now),
+                )
+            else:
+                cur.execute(
+                    f"UPDATE reports SET status = {self._ph}, urgency = {self._ph}, "
+                    f"patient_key = {self._ph}, payload = {self._ph}, updated = {self._ph} "
+                    f"WHERE tenant = {self._ph} AND id = {self._ph}",
+                    (status, urgency, patient_key, self._dumps(record), now,
+                     tenant, report_id),
+                )
+            if not self.is_postgres:
+                self._conn.commit()
+
+    def get_report(self, tenant: str, report_id: str) -> dict | None:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                f"SELECT payload FROM reports WHERE tenant = {self._ph} AND id = {self._ph}",
+                (clean_tenant(tenant), str(report_id)),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            try:
+                return self._loads(row[0])
+            except Exception:
+                return None
+
+    def list_reports(self, tenant: str, status: str | None = None,
+                     patient_key: str | None = None, limit: int = 200) -> list[dict]:
+        query = f"SELECT payload FROM reports WHERE tenant = {self._ph}"
+        params: list = [clean_tenant(tenant)]
+        if status:
+            query += f" AND status = {self._ph}"
+            params.append(status)
+        if patient_key:
+            query += f" AND patient_key = {self._ph}"
+            params.append(patient_key)
+        query += f" ORDER BY updated DESC LIMIT {self._ph}"
+        params.append(int(limit))
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(query, tuple(params))
+            rows: list[dict] = []
+            for (payload,) in cur.fetchall():
+                try:
+                    rows.append(self._loads(payload))
+                except Exception:
+                    continue
+            return rows
+
+    def delete_report(self, tenant: str, report_id: str) -> bool:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                f"DELETE FROM reports WHERE tenant = {self._ph} AND id = {self._ph}",
+                (clean_tenant(tenant), str(report_id)),
+            )
+            deleted = cur.rowcount > 0
+            if not self.is_postgres:
+                self._conn.commit()
+            return deleted
 
     def record(self, event: Event) -> None:
         try:

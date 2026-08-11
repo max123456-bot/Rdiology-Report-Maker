@@ -122,3 +122,160 @@ def audit(
     )
     result.ok = not result.missing and not result.added
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Reconciliation - where exactly did the lost words live?
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class Insertion:
+    """One dropped span, with enough context to put it back."""
+
+    tokens: list[str]        # the words, verbatim from the source
+    word_index: int          # position in the source's word sequence
+    before: str              # up to three source words preceding the span
+    after: str               # up to three source words following the span
+
+    @property
+    def text(self) -> str:
+        return " ".join(self.tokens)
+
+
+def reconciliation_plan(raw_text: str, output_text: str) -> list[Insertion]:
+    """
+    Word-level alignment between the source and any derived text, returning
+    each dropped span with its exact position and context.
+
+    difflib's SequenceMatcher gives the same longest-match alignment
+    diff-match-patch would at word granularity, with nothing to install.
+    Comparison is case-insensitive (headings get uppercased by design) and
+    list markers are ignored on both sides.
+    """
+    source_words = _TOKEN.findall(_strip_list_markers(raw_text))
+    output_words = _TOKEN.findall(_strip_list_markers(output_text))
+    import difflib
+
+    matcher = difflib.SequenceMatcher(
+        None,
+        [w.lower() for w in source_words],
+        [w.lower() for w in output_words],
+        autojunk=False,
+    )
+    plan: list[Insertion] = []
+    for op, s1, s2, _t1, _t2 in matcher.get_opcodes():
+        if op not in ("delete", "replace"):
+            continue
+        dropped = [w for w in source_words[s1:s2] if w not in _IGNORED]
+        if not dropped:
+            continue
+        plan.append(Insertion(
+            tokens=dropped,
+            word_index=s1,
+            before=" ".join(source_words[max(0, s1 - 3):s1]),
+            after=" ".join(source_words[s2:s2 + 3]),
+        ))
+    return plan
+
+
+def auto_reconcile(target_text: str, plan: list[Insertion]) -> tuple[str, list[Insertion], list[Insertion]]:
+    """
+    Re-insert dropped spans into `target_text` at their context anchors.
+
+    Non-destructive and non-inventive: every inserted word comes verbatim
+    from the plan (i.e. from the original source), and anything whose anchor
+    cannot be found is returned as skipped rather than guessed at. Callers
+    surface this behind an explicit user action - the engine never rewrites
+    a report on its own; that is this project's first rule.
+    """
+    applied: list[Insertion] = []
+    skipped: list[Insertion] = []
+    text = target_text
+
+    for insertion in plan:
+        anchor = insertion.before.strip()
+        if anchor:
+            pattern = re.compile(
+                r"(" + r"\s+".join(re.escape(w) for w in anchor.split()) + r")",
+                re.I,
+            )
+            match = pattern.search(text)
+            if match:
+                text = (text[:match.end()] + " " + insertion.text
+                        + text[match.end():])
+                applied.append(insertion)
+                continue
+        after_anchor = insertion.after.strip()
+        if after_anchor:
+            pattern = re.compile(
+                r"(" + r"\s+".join(re.escape(w) for w in after_anchor.split()) + r")",
+                re.I,
+            )
+            match = pattern.search(text)
+            if match:
+                text = (text[:match.start()] + insertion.text + " "
+                        + text[match.start():])
+                applied.append(insertion)
+                continue
+        skipped.append(insertion)
+    return text, applied, skipped
+
+
+# --------------------------------------------------------------------------- #
+# Attestation - a hash-chained record that the audit ran and what it said
+# --------------------------------------------------------------------------- #
+
+
+def attestation(raw_text: str, docx_bytes: bytes, ok: bool,
+                previous_chain: str = "") -> dict:
+    """
+    A tamper-evident record of one audit: SHA-256 of the source, SHA-256 of
+    the output, the verdict, and a chain hash binding this record to the one
+    before it. Recompute the chain over the log and any edited entry breaks
+    every hash after it - that is the compliance property.
+    """
+    import hashlib
+    from datetime import datetime, timezone
+
+    source_sha = hashlib.sha256((raw_text or "").encode("utf-8")).hexdigest()
+    output_sha = hashlib.sha256(docx_bytes or b"").hexdigest()
+    verdict = "PASS" if ok else "FAIL"
+    chain = hashlib.sha256(
+        f"{previous_chain}|{source_sha}|{output_sha}|{verdict}".encode("ascii")
+    ).hexdigest()
+    return {
+        "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source_sha256": source_sha,
+        "output_sha256": output_sha,
+        "verdict": verdict,
+        "chain": chain,
+    }
+
+
+def record_attestation(raw_text: str, docx_bytes: bytes, ok: bool,
+                       subject: str = "") -> dict:
+    """
+    Compute the attestation chained onto the last one in the audit log, and
+    record it. Storage failures never block clinical work - the attestation
+    is still returned for the caller to show.
+    """
+    import json
+
+    previous = ""
+    try:
+        import storage
+
+        for event in storage.get_store().events(limit=500):
+            if event.kind == "audit.attest":
+                try:
+                    previous = json.loads(event.detail).get("chain", "")
+                except Exception:
+                    previous = ""
+                break
+        record = attestation(raw_text, docx_bytes, ok, previous_chain=previous)
+        storage.log("audit.attest", subject or "report",
+                    detail=json.dumps(record, ensure_ascii=False))
+        return record
+    except Exception:
+        return attestation(raw_text, docx_bytes, ok, previous_chain=previous)

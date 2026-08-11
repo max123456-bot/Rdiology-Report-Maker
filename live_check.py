@@ -173,6 +173,64 @@ def main() -> int:
     print("        To test real audio: open the 🎙 Dictate tab, record a sentence with a")
     print("        measurement in it, and check the number came through exactly.")
 
+    # ---------------------------------------------------------------- #
+    print("\n7. Auto-impression from findings")
+    findings_text = (
+        "Liver is enlarged, measures 16.8 cm, with diffusely increased echogenicity.\n"
+        "A 6.2 mm calculus in the lower right ureter with mild hydronephrosis.\n"
+        "Gallbladder, pancreas and spleen are normal."
+    )
+    try:
+        points = ai_parser.draft_impression(findings_text, key, MODEL, reloaded)
+    except Exception as exc:
+        print(f"  FAIL  impression drafting failed: {exc}")
+        templates.delete(TEMP_NAME)
+        return 1
+    check(bool(points), f"{len(points)} impression point(s) came back")
+    for point in points:
+        print(f"    - {point}")
+    import re as _re
+
+    findings_numbers = set(_re.findall(r"\d+(?:\.\d+)?", findings_text))
+    invented = [
+        n for p in points for n in _re.findall(r"\d+(?:\.\d+)?", p)
+        if n not in findings_numbers
+    ]
+    check(not invented,
+          "every number in the impression exists in the findings"
+          if not invented else f"numbers invented by the model: {', '.join(invented)}")
+
+    # ---------------------------------------------------------------- #
+    print("\n8. Scan pre-read (set LIVE_SCAN_IMAGE to a chest X-ray .png/.jpg to run)")
+    scan_path = os.environ.get("LIVE_SCAN_IMAGE", "").strip()
+    if not scan_path:
+        print("        skipped - no LIVE_SCAN_IMAGE set. The prompt builder is covered")
+        print("        offline by clinical_check.py; this step needs a real image.")
+    elif not os.path.exists(scan_path):
+        check(False, f"LIVE_SCAN_IMAGE does not exist: {scan_path}")
+    else:
+        import readers as _readers
+
+        with open(scan_path, "rb") as fh:
+            scan_bytes = fh.read()
+        try:
+            pre = ai_parser.prefill_from_scan(
+                scan_bytes, _readers.mime_for(scan_path), key, MODEL,
+                context="Radiograph for AI pre-read evaluation",
+            )
+        except Exception as exc:
+            print(f"  FAIL  pre-read failed: {exc}")
+            templates.delete(TEMP_NAME)
+            return 1
+        check(bool(pre["findings"]), "a draft pre-read came back")
+        check(pre["confidence"] in ("high", "medium", "low"),
+              f"confidence is stated ({pre['confidence']})")
+        print("\n  --- pre-read ---")
+        for line in pre["findings"].splitlines():
+            print("  " + line)
+        for caveat in pre["caveats"]:
+            print(f"  caveat: {caveat}")
+
     templates.delete(TEMP_NAME)
     print(f"\n(temporary template {TEMP_NAME} removed)")
 

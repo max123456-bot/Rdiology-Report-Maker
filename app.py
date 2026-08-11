@@ -22,11 +22,22 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import access
+import dicom_meta
 import dictation_fix
+import guidelines
+import impression as impression_engine
+import interop
+import notify
+import pacs
+import providers
 import readers
+import records
 import storage
 import templates
+import triage as triage_engine
 import validate
+import workers
+import verify
 from hc_format import Block, ParseOptions, Span, build_docx, parse_report
 from verify import audit
 
@@ -777,7 +788,8 @@ def structure_editor(blocks: list[Block], signature: str) -> list[Block]:
     return out or blocks
 
 
-def render_audit(result, *, user_edited: bool = False) -> None:
+def render_audit(result, *, user_edited: bool = False,
+                 raw_text: str = "", docx_bytes: bytes | None = None) -> None:
     """Show an audit result. The audit itself runs inside the cached render."""
     if isinstance(result, dict):
         result = types.SimpleNamespace(**result)
@@ -808,6 +820,22 @@ def render_audit(result, *, user_edited: bool = False) -> None:
             "Common causes: the source repeated a heading word, or a line was pasted twice. "
             "Check the highlighted tokens before sending the report out."
         )
+
+    # Where exactly each dropped span lived - alignment against the source,
+    # with context, so the fix is a glance instead of a hunt.
+    if result.missing and raw_text and docx_bytes:
+        plan = verify.reconciliation_plan(raw_text, verify.docx_text(docx_bytes))
+        if plan:
+            with st.expander(f"Where the missing words were ({len(plan)} spot(s))"):
+                for entry in plan:
+                    st.markdown(
+                        f"…{entry.before} **:red[{entry.text}]** {entry.after}…"
+                    )
+                st.caption(
+                    "Each red span is verbatim from the source, shown in its "
+                    "original context. Restore them by editing the lines above - "
+                    "nothing is reinserted automatically."
+                )
 
 
 def to_pdf(docx_bytes: bytes) -> bytes | None:
@@ -842,9 +870,22 @@ def to_pdf(docx_bytes: bytes) -> bytes | None:
 st.title("HC Format Radiology Report Generator")
 st.caption("Every word preserved, and checked. Formatting per the selected doctor's template.")
 
-tab_single, tab_dictate, tab_batch, tab_draft, tab_templates, tab_rules = st.tabs(
-    ["Report", "Dictate", "Batch", "Draft in doctor's style", "Templates", "Rules"]
+(tab_single, tab_worklist, tab_dictate, tab_batch, tab_draft, tab_templates,
+ tab_rules) = st.tabs(
+    ["Report", "Worklist", "Dictate", "Batch", "Draft in doctor's style",
+     "Templates", "Rules"]
 )
+
+URGENCY_BADGE = {"stat": "🔴 STAT", "urgent": "🟠 Urgent", "routine": "⚪ Routine"}
+
+
+def stale_modules_banner() -> None:
+    st.warning(
+        "The server is running an older version of the code and needs a restart "
+        "to see the new features — press **Reboot** on Streamlit Cloud, or "
+        "restart `streamlit run app.py` locally.",
+        icon=":material/restart_alt:",
+    )
 
 
 # ---------------------------- Single report -------------------------------- #
@@ -882,31 +923,98 @@ with tab_single:
         )
         if uploaded:
             data = uploaded.getvalue()
-            try:
-                raw_text = readers.read_any(uploaded.name, data)
-            except readers.UnreadableFile as exc:
-                st.error(str(exc))
-            except readers.NeedsOCR as exc:
-                if use_ai and api_key and model_choice:
-                    with st.spinner("Reading the scan with AI OCR..."):
-                        try:
-                            import ai_parser
+            ext = os.path.splitext(uploaded.name)[1].lower()
 
-                            raw_text = ai_parser.extract_text_from_file(
-                                data, readers.mime_for(uploaded.name), api_key, model_choice
+            # A photographed report gets OCR'd verbatim. An actual scan image
+            # can instead get an AI pre-read that DRAFTS findings - clearly
+            # labelled, reviewed like any dictation, never sent as-is.
+            image_role = "report"
+            if ext in readers.IMAGE_EXT and use_ai and api_key and model_choice:
+                image_role = st.radio(
+                    "What is this image?",
+                    ["report", "scan"],
+                    format_func=lambda v: (
+                        "A photo/scan of a written report — OCR it verbatim"
+                        if v == "report"
+                        else "An actual scan image (X-ray/film) — AI pre-read drafts findings"
+                    ),
+                    horizontal=True,
+                )
+
+            if image_role == "scan":
+                context = st.text_input(
+                    "Study context (optional)",
+                    placeholder="e.g. Chest X-ray PA view, 52M, cough 3 weeks",
+                )
+                job_key = f"prefill_job::{uploaded.name}::{len(data)}"
+                if st.button(":material/neurology: Pre-read this scan with AI",
+                             type="primary"):
+                    provider = providers.active()
+                    st.session_state[job_key] = workers.submit(
+                        "prefill", provider.prefill, data,
+                        readers.mime_for(uploaded.name), api_key, model_choice,
+                        context,
+                    )
+                    st.rerun()
+                job_id = st.session_state.get(job_key)
+                if job_id:
+                    job = workers.status(job_id)
+                    if job is None:
+                        st.info("The pre-read was lost to a server restart — run it again.")
+                    elif job.status == "running":
+                        st.info("Pre-read running in the background — you can keep "
+                                "working in other tabs.")
+                        if st.button("Check progress"):
+                            st.rerun()
+                    elif job.status == "failed":
+                        st.error(f"Pre-read failed: {job.error}")
+                    else:
+                        result = job.result
+                        st.warning(
+                            "**AI pre-read draft** — review every line. Confidence: "
+                            f"{result.get('confidence', 'low')}.",
+                            icon=":material/smart_toy:",
+                        )
+                        for caveat in result.get("caveats", []):
+                            st.caption(f"⚠ {caveat}")
+                        raw_text = result.get("findings", "")
+            else:
+                try:
+                    raw_text = readers.read_any(uploaded.name, data)
+                except readers.UnreadableFile as exc:
+                    st.error(str(exc))
+                except readers.NeedsOCR as exc:
+                    # Hybrid hierarchy: OpenCV clean-up, then free local
+                    # Tesseract; Gemini only when the local read is not
+                    # confident enough (or absent).
+                    with st.spinner("Cleaning the scan and reading it..."):
+                        try:
+                            import imgprep
+
+                            ocr = imgprep.hybrid_ocr(
+                                data, readers.mime_for(uploaded.name),
+                                api_key if use_ai else "",
+                                model_choice if use_ai else "",
                             )
-                            st.info("Text transcribed by AI - check it below before generating.")
+                            raw_text = ocr.text
+                            st.info(f"{ocr.note} — check the text below before "
+                                    "generating.")
+                        except ValueError as ocr_exc:
+                            st.error(f"{exc} {ocr_exc}")
                         except Exception as ocr_exc:
                             st.error(f"OCR failed: {ocr_exc}")
-                else:
-                    st.error(
-                        f"{exc} Switch the engine to AI-assisted to read scanned PDFs and photos "
-                        "with OCR."
-                    )
             if raw_text:
                 raw_text = st.text_area("Extracted text (edit if needed)", raw_text, height=300)
 
     if raw_text.strip():
+        # Macro expansion: ".normalchest" typed or dictated becomes the full
+        # normal-template block BEFORE parsing, so the audit covers the
+        # expanded text like anything else.
+        raw_text, macros_used = templates.expand_macros(raw_text, template)
+        if macros_used:
+            st.info(f"Expanded macro(s): {', '.join(sorted(set(macros_used)))} — "
+                    "the full text is below, exactly as it will print.")
+
         auto_blocks, warnings, engine_used = make_blocks(raw_text)
 
         for warning in warnings:
@@ -953,6 +1061,13 @@ with tab_single:
                     f"template={template.name}; engine={engine_used}; "
                     f"{'edited' if user_edited else 'verbatim'}",
                 )
+                # Hash-chained attestation: a tamper-evident record that the
+                # word-loss audit ran on exactly these bytes, and what it said.
+                audit_ok = (audit_result.get("ok") if isinstance(audit_result, dict)
+                            else getattr(audit_result, "ok", False))
+                attest = verify.record_attestation(raw_text, docx_bytes,
+                                                   bool(audit_ok), subject=title)
+                st.caption(f"Audit attested · chain `{attest['chain'][:16]}…`")
             st.download_button(
                 ":material/download: Download .docx",
                 data=docx_bytes,
@@ -981,6 +1096,20 @@ with tab_single:
         with audit_col:
             st.subheader("Checks")
 
+            triaged = triage_engine.triage_blocks(blocks)
+            if triaged.level == "stat":
+                st.error(
+                    f"**STAT** — {', '.join(sorted({h.term for h in triaged.hits}))}. "
+                    "The referrer should hear about this before the report does the "
+                    "rounds — sign it and use the alert below.",
+                    icon=":material/e911_emergency:",
+                )
+            elif triaged.level == "urgent":
+                st.warning(
+                    f"**Urgent** — {', '.join(sorted({h.term for h in triaged.hits}))}.",
+                    icon=":material/priority_high:",
+                )
+
             clinical = validate.validate(blocks)
             if clinical.ok:
                 st.success("Report checks: nothing to flag.", icon=":material/check_circle:")
@@ -1003,7 +1132,321 @@ with tab_single:
                             st.caption(f"in {f.where}")
 
             st.divider()
-            render_audit(audit_result, user_edited=user_edited)
+            render_audit(audit_result, user_edited=user_edited,
+                         raw_text=raw_text, docx_bytes=docx_bytes)
+
+            if use_ai and api_key and model_choice:
+                if st.button(":material/psychology: AI second opinion",
+                             help="Deterministic checks above run always and "
+                                  "instantly. This sends the report text to the "
+                                  "model for a clinical-sense pass - meaning-level "
+                                  "contradictions the rules cannot see."):
+                    try:
+                        import ai_parser as _ai
+
+                        with st.spinner("Reading the report..."):
+                            opinion = _ai.second_opinion(raw_text, api_key,
+                                                         model_choice)
+                        if not opinion["issues"]:
+                            st.success("AI second opinion: nothing further to flag.")
+                        for issue in opinion["issues"]:
+                            icon = {"critical": ":material/error:",
+                                    "warning": ":material/warning:",
+                                    "note": ":material/info:"}[issue["severity"]]
+                            with st.container(border=True):
+                                st.markdown(f"{icon} **{issue['title']}**")
+                                if issue["detail"]:
+                                    st.caption(issue["detail"])
+                    except Exception as exc:
+                        st.error(f"Second opinion failed: {exc}")
+
+        # ------------------- clinical intelligence panels ------------------ #
+
+        can_append = source == "Paste text"
+
+        def append_to_report(addition: str, heading: str = "RECOMMENDATION") -> None:
+            """Append text to the source under a heading, then re-parse."""
+            base = raw_text.rstrip()
+            if re.search(rf"^\s*{heading}S?\s*:?\s*$", base, re.M | re.I):
+                new_text = f"{base}\n{addition.strip()}"
+            else:
+                new_text = f"{base}\n\n{heading}:\n{addition.strip()}"
+            st.session_state["prefill"] = new_text
+            st.session_state["editor_resets"] = st.session_state.get("editor_resets", 0) + 1
+            st.rerun()
+
+        advice = guidelines.advise_blocks(blocks)
+        if advice:
+            with st.expander(f":material/rule: Guideline suggestions ({len(advice)})",
+                             expanded=False):
+                st.caption(
+                    "Consensus guidelines triggered by the findings. Nothing is inserted "
+                    "automatically — review, then append or ignore."
+                )
+                for i, a in enumerate(advice):
+                    with st.container(border=True):
+                        st.markdown(f"**{a.system}** · {a.kind}")
+                        st.caption(f"Triggered by: “{a.trigger}”")
+                        st.code(a.recommendation, language=None)
+                        if can_append and st.button(
+                            "Append under RECOMMENDATION", key=f"guideline_add_{i}"
+                        ):
+                            append_to_report(f"- {a.recommendation}")
+                        elif not can_append:
+                            st.caption("Copy the text above — appending works in paste mode.")
+
+        findings_only = "\n".join(
+            line for line in (
+                b.trailer if b.kind == "heading_inline" else b.text
+                for b in blocks
+                if (b.section or "").upper() in ("FINDINGS", "OBSERVATIONS")
+                and b.kind not in ("heading",)
+            ) if line and line.strip()
+        )
+        with st.expander(":material/bolt: Impression assistant"):
+            if not findings_only.strip():
+                st.caption("No FINDINGS section detected — nothing to draft from.")
+            else:
+                proposals = impression_engine.propose_from_findings(findings_only)
+                normal_line = impression_engine.normal_study_line(findings_only)
+                if proposals:
+                    st.caption(
+                        "Abnormal findings pulled verbatim from the FINDINGS — the "
+                        "deterministic draft. Every line already exists in the report."
+                    )
+                    st.code(impression_engine.as_impression_block(proposals), language=None)
+                    if can_append and st.button("Append as IMPRESSION",
+                                                key="impression_rule_add"):
+                        append_to_report(
+                            impression_engine.as_impression_block(proposals), "IMPRESSION"
+                        )
+                elif normal_line:
+                    st.caption("Nothing abnormal detected in the findings.")
+                    st.code(normal_line, language=None)
+                    if can_append and st.button("Append as IMPRESSION",
+                                                key="impression_normal_add"):
+                        append_to_report(f"- {normal_line}", "IMPRESSION")
+
+                if use_ai and api_key and model_choice:
+                    ai_imp_key = f"ai_impression::{hash(raw_text)}"
+                    if st.button(":material/smart_toy: Draft impression with AI",
+                                 key="impression_ai_btn"):
+                        try:
+                            provider = providers.active()
+                            with st.spinner("Drafting the impression..."):
+                                st.session_state[ai_imp_key] = provider.impression(
+                                    findings_only, api_key, model_choice, template
+                                )
+                        except Exception as exc:
+                            st.error(f"AI impression failed: {exc}")
+                    ai_points = st.session_state.get(ai_imp_key)
+                    if ai_points:
+                        st.caption("AI draft, in this doctor's style — review before use.")
+                        st.code("\n".join(f"- {p}." for p in ai_points), language=None)
+                        if can_append and st.button("Append AI impression",
+                                                    key="impression_ai_add"):
+                            append_to_report(
+                                "\n".join(f"- {p}." for p in ai_points), "IMPRESSION"
+                            )
+
+        with st.expander(":material/radiology: Cross-check against the scan (DICOM)"):
+            st.caption(
+                "Drop a `.dcm` file from the study. Its header — side scanned, patient "
+                "sex, age, modality, name — is checked against the report text. "
+                "Metadata only; no image is interpreted and nothing leaves the machine."
+            )
+            dcm_file = st.file_uploader("DICOM file", type=["dcm"], key="dicom_check")
+            if dcm_file:
+                try:
+                    meta = dicom_meta.read_meta(dcm_file.getvalue())
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    st.caption(f"Scan says: {dicom_meta.describe(meta)}")
+                    id_fields = records.fields_from_blocks(blocks)
+                    issues = dicom_meta.cross_check(
+                        meta, raw_text, id_fields["patient"], id_fields["age_sex"]
+                    )
+                    if not issues:
+                        st.success("Report and scan metadata agree.")
+                    for f in issues:
+                        icon = {"critical": ":material/error:",
+                                "warning": ":material/warning:",
+                                "note": ":material/info:"}[f.severity]
+                        with st.container(border=True):
+                            st.markdown(f"{icon} **{f.title}**")
+                            if f.detail:
+                                st.caption(f.detail)
+
+        preview_record = None
+        prior_rows: list[dict] = []
+        try:
+            preview_record = records.new_record(raw_text, blocks, source="paste")
+            prior_rows = records.priors(preview_record)
+        except AttributeError:
+            stale_modules_banner()
+        except Exception:
+            prior_rows = []
+        if prior_rows:
+            with st.expander(
+                f":material/history: Prior reports for this patient ({len(prior_rows)})",
+                expanded=True,
+            ):
+                st.caption(
+                    "Matched on patient name and sex — check it is really the same "
+                    "person before trusting a comparison."
+                )
+                labels = {
+                    r["id"]: f"{r.get('study') or 'Study'} · "
+                             f"{(r.get('created') or '')[:10]} · {r.get('status')}"
+                    for r in prior_rows
+                }
+                chosen_id = st.selectbox(
+                    "Compare against", list(labels), format_func=labels.get
+                )
+                prior = next(r for r in prior_rows if r["id"] == chosen_id)
+                deltas = records.compare(preview_record, prior)
+                if not deltas:
+                    st.caption("Nothing comparable between the two reports.")
+                else:
+                    st.caption(records.comparison_summary(deltas))
+                    icons = {"grew": "📈", "shrank": "📉", "stable": "▪",
+                             "new": "🆕", "gone": "❓"}
+                    st.dataframe(
+                        [{
+                            "": icons.get(d.kind, ""),
+                            "What": d.key,
+                            "Then": d.before,
+                            "Now": d.after,
+                            "Change": d.note,
+                        } for d in deltas],
+                        use_container_width=True, hide_index=True,
+                    )
+
+        # ----------------------- worklist & delivery ----------------------- #
+
+        st.divider()
+        st.subheader("Worklist & delivery")
+        record_map = st.session_state.setdefault("worklist_records", {})
+        content_key = str(hash((raw_text, template.name)))
+        rec_id = record_map.get(content_key)
+        stored = None
+        try:
+            if rec_id:
+                stored = storage.get_store().get_report(active_tenant(), rec_id)
+
+            if stored is None:
+                col_save, col_sign, _sp = st.columns([1, 1, 2])
+                with col_save:
+                    if st.button(":material/playlist_add: Save to worklist",
+                                 use_container_width=True,
+                                 help="Stores this report as a draft: it appears in the "
+                                      "Worklist tab and becomes this patient's history."):
+                        rec = records.new_record(raw_text, blocks, source="paste")
+                        records.save(rec)
+                        record_map[content_key] = rec["id"]
+                        st.rerun()
+                with col_sign:
+                    sign_help = ("Marks the report signed by you and stores it. "
+                                 "Signing unlocks delivery, HL7/FHIR export and alerts.")
+                    if clinical.critical:
+                        sign_help += (" There are critical check findings above - "
+                                      "signing is still your call.")
+                    if st.button(":material/draw: Sign & save", type="primary",
+                                 use_container_width=True, help=sign_help):
+                        rec = records.new_record(raw_text, blocks, source="paste")
+                        records.sign(rec, user=storage.current_user())
+                        records.save(rec)
+                        record_map[content_key] = rec["id"]
+                        st.rerun()
+            else:
+                status_line = (
+                    f"{URGENCY_BADGE.get(stored.get('urgency'), '')} · "
+                    f"**{stored.get('status', 'draft').upper()}**"
+                )
+                if stored.get("signed_at"):
+                    status_line += (f" · signed {stored['signed_at'][:16]}"
+                                    + (f" by {stored['signed_by']}" if stored.get("signed_by") else ""))
+                st.markdown(status_line)
+
+                act_col, hl7_col, fhir_col = st.columns(3)
+                with act_col:
+                    if stored.get("status") == "draft":
+                        if st.button(":material/draw: Sign report", type="primary",
+                                     use_container_width=True):
+                            records.sign(stored, user=storage.current_user())
+                            records.save(stored)
+                            st.rerun()
+                    elif stored.get("status") == "signed":
+                        if st.button(":material/local_shipping: Mark delivered",
+                                     use_container_width=True,
+                                     help="Records that the report went out (with the "
+                                          ".docx download as the channel)."):
+                            records.deliver(stored, user=storage.current_user(),
+                                            via="download")
+                            records.save(stored)
+                            st.rerun()
+                    else:
+                        st.caption(f"Delivered {stored.get('delivered_at', '')[:16]} "
+                                   f"via {stored.get('delivered_via', '')}")
+                with hl7_col:
+                    st.download_button(
+                        ":material/output: HL7 ORU (RIS/EHR)",
+                        data=interop.hl7_oru(stored),
+                        file_name=safe_filename(title).replace(".docx", ".hl7"),
+                        mime="text/plain",
+                        use_container_width=True,
+                        help="An HL7 v2.5 ORU^R01 message carrying the full report - "
+                             "what a hospital integration engine (Mirth etc.) ingests.",
+                    )
+                with fhir_col:
+                    st.download_button(
+                        ":material/output: FHIR bundle (JSON)",
+                        data=interop.fhir_json(stored, docx_bytes),
+                        file_name=safe_filename(title).replace(".docx", ".fhir.json"),
+                        mime="application/fhir+json",
+                        use_container_width=True,
+                        help="A FHIR R4 DiagnosticReport bundle with the report text "
+                             "and the .docx attached.",
+                    )
+
+                if stored.get("urgency") in ("stat", "urgent") and \
+                        stored.get("status") in ("signed", "delivered"):
+                    st.markdown("**Critical result alert**")
+                    channels = notify.channels_available()
+                    if not channels:
+                        st.caption(
+                            "No alert channel is configured. Set `ALERT_SMTP_HOST` (+ "
+                            "`ALERT_SMTP_USER`, `ALERT_SMTP_PASSWORD`, `ALERT_FROM`) for "
+                            "email, or `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` and "
+                            "`TWILIO_FROM` for SMS and WhatsApp, in Streamlit secrets."
+                        )
+                    else:
+                        alert_preview = notify.build_alert(stored)
+                        with st.container(border=True):
+                            st.caption(alert_preview.subject)
+                            st.text(alert_preview.body)
+                        to_contact = st.text_input(
+                            "Referrer's contact",
+                            placeholder="doctor@hospital.in or +919876543210",
+                            key="alert_to",
+                        )
+                        chosen = st.multiselect("Channels", channels,
+                                                default=channels[:1], key="alert_ch")
+                        if st.button(":material/campaign: Send alert", type="primary"):
+                            if not to_contact.strip() or not chosen:
+                                st.error("A contact and at least one channel are needed.")
+                            else:
+                                for res in notify.send_alert(stored, to_contact.strip(),
+                                                             chosen):
+                                    (st.success if res.ok else st.error)(
+                                        f"{res.channel}: {res.detail}"
+                                    )
+                                storage.log("alert.sent",
+                                            stored.get("study") or stored.get("id", ""),
+                                            detail=", ".join(chosen))
+        except AttributeError:
+            stale_modules_banner()
 
         if not template.builtin:
             if st.button(
@@ -1027,6 +1470,335 @@ with tab_single:
                 use_container_width=True,
                 hide_index=True,
             )
+
+
+# ------------------------------ Worklist ----------------------------------- #
+
+with tab_worklist:
+    st.caption(
+        "Every report saved from the Report tab, stat cases first. Signing and "
+        "delivery are recorded here and in the audit log."
+    )
+    try:
+        head_l, head_r = st.columns([3, 1])
+        with head_r:
+            wl_status = st.selectbox(
+                "Show", ["all", "draft", "signed", "delivered"], key="wl_status"
+            )
+        rows = records.worklist(status=None if wl_status == "all" else wl_status)
+
+        with head_l:
+            if rows:
+                counts: dict[str, int] = {}
+                for r in rows:
+                    counts[str(r.get("urgency", "routine"))] = \
+                        counts.get(str(r.get("urgency", "routine")), 0) + 1
+                st.markdown(" · ".join(
+                    f"{URGENCY_BADGE.get(level, level)} × {counts[level]}"
+                    for level in ("stat", "urgent", "routine") if level in counts
+                ))
+
+        if not rows:
+            st.info(
+                "Nothing here yet. Generate a report in the **Report** tab and press "
+                "**Save to worklist** or **Sign & save**."
+            )
+        for rec in rows:
+            badge = URGENCY_BADGE.get(str(rec.get("urgency")), "⚪")
+            label = " · ".join(x for x in (
+                badge,
+                rec.get("patient") or "Unnamed patient",
+                rec.get("study") or "Study",
+                str(rec.get("status", "draft")).upper(),
+                (rec.get("updated") or "")[:16].replace("T", " "),
+            ) if x)
+            with st.expander(label):
+                meta_bits = [b for b in (
+                    rec.get("age_sex"), rec.get("modality"),
+                    f"referred by {rec['referrer']}" if rec.get("referrer") else "",
+                    f"source: {rec.get('source', '')}",
+                ) if b]
+                if meta_bits:
+                    st.caption(" · ".join(meta_bits))
+                if rec.get("triage_terms"):
+                    st.caption("Triage: " + ", ".join(rec["triage_terms"]))
+
+                st.text(rec.get("report_text", "")[:4000])
+
+                trail = rec.get("trail") or []
+                if trail:
+                    st.caption(" → ".join(
+                        f"{t.get('what')} {(t.get('when') or '')[:16]}"
+                        + (f" ({t['user']})" if t.get("user") else "")
+                        for t in trail
+                    ))
+
+                b1, b2, b3, b4 = st.columns(4)
+                with b1:
+                    if rec.get("status") == "draft":
+                        if st.button("Sign", key=f"wl_sign_{rec['id']}",
+                                     use_container_width=True):
+                            records.sign(rec, user=storage.current_user())
+                            records.save(rec)
+                            st.rerun()
+                    elif rec.get("status") == "signed":
+                        if st.button("Mark delivered", key=f"wl_deliver_{rec['id']}",
+                                     use_container_width=True):
+                            records.deliver(rec, user=storage.current_user(),
+                                            via="worklist")
+                            records.save(rec)
+                            st.rerun()
+                with b2:
+                    st.download_button(
+                        "HL7 ORU", data=interop.hl7_oru(rec),
+                        file_name=f"report-{rec['id']}.hl7", mime="text/plain",
+                        key=f"wl_hl7_{rec['id']}", use_container_width=True,
+                    )
+                with b3:
+                    st.download_button(
+                        "FHIR JSON", data=interop.fhir_json(rec),
+                        file_name=f"report-{rec['id']}.fhir.json",
+                        mime="application/fhir+json",
+                        key=f"wl_fhir_{rec['id']}", use_container_width=True,
+                    )
+                with b4:
+                    if st.button("Delete", key=f"wl_del_{rec['id']}",
+                                 use_container_width=True,
+                                 help="Removes the record from the worklist and the "
+                                      "patient's history. The audit log entry stays."):
+                        storage.get_store().delete_report(active_tenant(), rec["id"])
+                        storage.log("report.deleted", rec.get("study") or rec["id"])
+                        st.rerun()
+    except AttributeError:
+        stale_modules_banner()
+
+    # ------------------------------ PACS ------------------------------- #
+
+    st.divider()
+    st.subheader("PACS")
+
+    def _prefill_from_image(image_bytes: bytes, mime: str, context: str,
+                            job_state_key: str, button_key: str) -> None:
+        """Shared pre-read flow: submit, poll, land the draft in the Report tab."""
+        if not (use_ai and api_key and model_choice):
+            st.caption("AI pre-read needs the AI-assisted engine and a Gemini key.")
+            return
+        if st.button(":material/neurology: AI pre-read", key=button_key):
+            st.session_state[job_state_key] = workers.submit(
+                "prefill", providers.active().prefill, image_bytes, mime,
+                api_key, model_choice, context,
+            )
+            st.rerun()
+        job_id = st.session_state.get(job_state_key)
+        if job_id:
+            job = workers.status(job_id)
+            if job is None:
+                st.caption("The pre-read was lost to a restart — run it again.")
+            elif job.status == "running":
+                st.info("Pre-read running…")
+                if st.button("Check progress", key=f"{button_key}_poll"):
+                    st.rerun()
+            elif job.status == "failed":
+                st.error(f"Pre-read failed: {job.error}")
+            else:
+                st.session_state["prefill"] = job.result.get("findings", "")
+                st.session_state.pop(job_state_key, None)
+                st.success("Draft findings are waiting in the **Report** tab "
+                           "(paste area). Review every line.")
+
+    with st.expander(":material/dns: Orthanc server",
+                     expanded=bool(pacs.orthanc_config())):
+        if not pacs.orthanc_config():
+            st.caption(
+                "Point the app at the clinic's Orthanc DICOM server and its "
+                "studies appear here — works from Streamlit Cloud too, because "
+                "the app dials out. Set `ORTHANC_URL` (plus `ORTHANC_USERNAME` "
+                "and `ORTHANC_PASSWORD` if secured) in Streamlit secrets. "
+                "Orthanc itself is a free download: orthanc-server.com."
+            )
+        else:
+            try:
+                system = pacs.orthanc_system()
+                st.success(f"Connected — Orthanc {system.get('Version', '?')} "
+                           f"({system.get('Name', '')})")
+                for study in pacs.orthanc_recent_studies(limit=10):
+                    with st.container(border=True):
+                        st.markdown(
+                            f"**{study['patient'] or 'Unnamed'}** · "
+                            f"{study['sex'] or '?'} · "
+                            f"{study['description'] or 'No description'} · "
+                            f"{study['study_date']}"
+                        )
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            if st.button("Fetch .dcm for cross-check",
+                                         key=f"orth_fetch_{study['id']}",
+                                         use_container_width=True):
+                                instance = pacs.orthanc_first_instance(study["id"])
+                                st.session_state[f"orth_file_{study['id']}"] = \
+                                    pacs.orthanc_instance_file(instance)
+                            fetched = st.session_state.get(f"orth_file_{study['id']}")
+                            if fetched:
+                                st.download_button(
+                                    "Download .dcm", data=fetched,
+                                    file_name=f"{study['id'][:12]}.dcm",
+                                    mime="application/dicom",
+                                    key=f"orth_dl_{study['id']}",
+                                    use_container_width=True,
+                                    help="Drop it into the DICOM cross-check on "
+                                         "the Report tab.",
+                                )
+                        with c2:
+                            preview_key = f"orth_png_{study['id']}"
+                            if st.button("Load preview", key=f"orth_prev_{study['id']}",
+                                         use_container_width=True):
+                                instance = pacs.orthanc_first_instance(study["id"])
+                                st.session_state[preview_key] = \
+                                    pacs.orthanc_preview_png(instance)
+                            png = st.session_state.get(preview_key)
+                            if png:
+                                st.image(png, width=220)
+                                _prefill_from_image(
+                                    png, "image/png",
+                                    study.get("description", ""),
+                                    f"orth_job_{study['id']}",
+                                    f"orth_preread_{study['id']}",
+                                )
+            except RuntimeError as exc:
+                st.error(str(exc))
+
+    with st.expander(":material/settings_input_antenna: DICOM receiver (C-STORE)"):
+        if not pacs.PYNETDICOM_OK:
+            st.caption("The receiver needs pynetdicom:  `pip install pynetdicom` "
+                       "— then restart the app.")
+        else:
+            st.caption(
+                "Modalities push studies straight to this machine — point the "
+                "scanner's DICOM send at this computer's IP with the AE title and "
+                "port below. Works on the clinic LAN install; Streamlit Cloud "
+                "cannot accept inbound DICOM connections."
+            )
+            running = pacs.receiver_running()
+            if running is None:
+                rc1, rc2, rc3 = st.columns([1.4, 1, 1.2])
+                with rc1:
+                    rx_aet = st.text_input("AE title", value=pacs.DEFAULT_AET,
+                                           key="rx_aet")
+                with rc2:
+                    rx_port = st.number_input("Port", value=11112, min_value=1,
+                                              max_value=65535, key="rx_port")
+                with rc3:
+                    st.write("")
+                    if st.button(":material/play_arrow: Start listening",
+                                 use_container_width=True):
+                        try:
+                            pacs.start_receiver(int(rx_port), aet=rx_aet.strip()
+                                                or pacs.DEFAULT_AET)
+                            storage.log("pacs.receiver", f"{rx_aet}:{rx_port}",
+                                        detail="started")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Could not start: {exc}")
+            else:
+                st.success(f"Listening — AE **{running.aet}**, port "
+                           f"**{running.port}** · {running.received} instance(s) "
+                           "received this session")
+                if st.button(":material/stop: Stop listening"):
+                    pacs.stop_receiver()
+                    storage.log("pacs.receiver", f"{running.aet}:{running.port}",
+                                detail="stopped")
+                    st.rerun()
+
+            received = pacs.received_studies()
+            if received:
+                st.markdown(f"**Received studies ({len(received)})**")
+            for study in received:
+                with st.container(border=True):
+                    st.markdown(
+                        f"**{study['patient'] or 'Unnamed'}** · "
+                        f"{study['sex'] or '?'} {study['age']} · "
+                        f"{study['modality']} · "
+                        f"{study['description'] or 'No description'} · "
+                        f"{len(study['instances'])} instance(s) · "
+                        f"{study['when'][:16].replace('T', ' ')}"
+                    )
+                    first = study["instances"][0]
+                    rcv1, rcv2, rcv3 = st.columns(3)
+                    with rcv1:
+                        with open(first, "rb") as fh:
+                            st.download_button(
+                                "Download .dcm", data=fh.read(),
+                                file_name=os.path.basename(first),
+                                mime="application/dicom",
+                                key=f"rx_dl_{study['study_uid']}",
+                                use_container_width=True,
+                            )
+                    with rcv2:
+                        try:
+                            with open(first, "rb") as fh:
+                                rx_png = pacs.to_png(fh.read())
+                            _prefill_from_image(
+                                rx_png, "image/png", study.get("description", ""),
+                                f"rx_job_{study['study_uid']}",
+                                f"rx_preread_{study['study_uid']}",
+                            )
+                        except ValueError as exc:
+                            st.caption(f"No renderable pixels: {exc}")
+                    with rcv3:
+                        if st.button("Remove", key=f"rx_rm_{study['study_uid']}",
+                                     use_container_width=True,
+                                     help="Deletes the spooled files from this "
+                                          "machine."):
+                            pacs.clear_received(study["study_uid"])
+                            st.rerun()
+
+    with st.expander(":material/search: Query a PACS (C-ECHO / C-FIND)"):
+        if not pacs.PYNETDICOM_OK:
+            st.caption("Querying needs pynetdicom:  `pip install pynetdicom`.")
+        else:
+            q1, q2, q3 = st.columns([1.6, 1, 1.2])
+            with q1:
+                qr_host = st.text_input("PACS host / IP", key="qr_host")
+            with q2:
+                qr_port = st.number_input("Port", value=104, min_value=1,
+                                          max_value=65535, key="qr_port")
+            with q3:
+                qr_aet = st.text_input("Called AE title", value="ANY-SCP",
+                                       key="qr_aet")
+            e1, e2 = st.columns([1, 3])
+            with e1:
+                if st.button("C-ECHO test", use_container_width=True):
+                    ok, detail = pacs.echo(qr_host.strip(), int(qr_port),
+                                           qr_aet.strip() or "ANY-SCP")
+                    (st.success if ok else st.error)(detail)
+            with e2:
+                qr_name = st.text_input(
+                    "Patient name filter (DICOM wildcards, e.g. SHARMA*)",
+                    key="qr_name",
+                )
+            if st.button(":material/search: C-FIND studies", type="primary"):
+                if not qr_host.strip():
+                    st.error("A PACS host is needed.")
+                else:
+                    try:
+                        found = pacs.find_studies(
+                            qr_host.strip(), int(qr_port),
+                            qr_aet.strip() or "ANY-SCP",
+                            patient_name=qr_name.strip() or "*",
+                        )
+                        if not found:
+                            st.info("The PACS answered with no matching studies.")
+                        else:
+                            st.dataframe(
+                                [{"Patient": r["patient"], "Sex": r["sex"],
+                                  "Date": r["study_date"],
+                                  "Description": r["description"],
+                                  "Modalities": r["modalities"]}
+                                 for r in found],
+                                use_container_width=True, hide_index=True,
+                            )
+                    except RuntimeError as exc:
+                        st.error(str(exc))
 
 
 # ------------------------------- Batch ------------------------------------- #

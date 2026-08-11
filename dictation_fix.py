@@ -345,6 +345,187 @@ def near_misses(text: str, vocabulary: list[str], threshold: float = 0.78) -> li
 
 
 # --------------------------------------------------------------------------- #
+# Medical inverse text normalisation (ITN)
+# --------------------------------------------------------------------------- #
+
+# Compound units as spoken, mapped to ISO medical notation. Applied only when a
+# number precedes them, so prose ("dose per day") is never rewritten.
+_COMPOUND_UNITS = (
+    (re.compile(r"(\d(?:\.\d+)?)\s*(?:milligrams?|mg)\s+per\s+(?:deciliter|decilitre|dl)\b", re.I),
+     r"\1 mg/dL"),
+    (re.compile(r"(\d(?:\.\d+)?)\s*(?:grams?|g)\s+per\s+(?:deciliter|decilitre|dl)\b", re.I),
+     r"\1 g/dL"),
+    (re.compile(r"(\d(?:\.\d+)?)\s*(?:milligrams?|mg)\s+per\s+(?:liter|litre|l)\b", re.I),
+     r"\1 mg/L"),
+    (re.compile(r"(\d(?:\.\d+)?)\s*(?:liters?|litres?|l)\s+per\s+min(?:ute)?\b", re.I),
+     r"\1 L/min"),
+    (re.compile(r"(\d(?:\.\d+)?)\s*(?:millimeters?|millimetres?|mm)\s+(?:of\s+)?mercury\b", re.I),
+     r"\1 mm Hg"),
+    (re.compile(r"(\d(?:\.\d+)?)\s*beats?\s+per\s+min(?:ute)?\b", re.I), r"\1 bpm"),
+    (re.compile(r"(\d(?:\.\d+)?)\s*hounsfield\s+units?\b", re.I), r"\1 HU"),
+    (re.compile(r"(\d(?:\.\d+)?)\s*suv\b", re.I), r"\1 SUV"),
+)
+
+_ROMAN = {"one": "I", "two": "II", "three": "III", "four": "IV", "five": "V",
+          "1": "I", "2": "II", "3": "III", "4": "IV", "5": "V",
+          "i": "I", "ii": "II", "iii": "III", "iv": "IV", "v": "V"}
+
+# "grade two spondylolisthesis" -> "Grade II spondylolisthesis". Clinical
+# grading is written in Roman numerals; the mapping is one-to-one, so this is
+# one of the few conversions that is genuinely unambiguous.
+_GRADE = re.compile(r"\bgrade[ -](one|two|three|four|five|[1-5]|iv|iii|ii|i|v)\b", re.I)
+
+_NUMBER_TOKEN = rf"(?:{_NUMBER_WORD})(?:[ -](?:{_NUMBER_WORD}))*"
+# A spoken range: "<number words> to <number words> <unit>".
+_SPOKEN_RANGE = re.compile(
+    rf"\b({_NUMBER_TOKEN})\s+to\s+({_NUMBER_TOKEN})\s+"
+    rf"(millimetres?|millimeters?|centimetres?|centimeters?|mm|cm)\b",
+    re.I,
+)
+
+
+def iso_units(text: str) -> tuple[str, int]:
+    """Standardise compound medical units: mg/dL, mm Hg, bpm, L/min, HU, SUV."""
+    changes = 0
+    for pattern, replacement in _COMPOUND_UNITS:
+        text, n = pattern.subn(replacement, text)
+        changes += n
+    return text, changes
+
+
+def grades(text: str) -> tuple[str, int]:
+    """Clinical grades to Roman numerals."""
+    changes = 0
+
+    def replace(match: re.Match) -> str:
+        nonlocal changes
+        changes += 1
+        return f"Grade {_ROMAN[match.group(1).lower()]}"
+
+    return _GRADE.sub(replace, text), changes
+
+
+def protect_ambiguous_ranges(text: str) -> tuple[str, list[Suggestion], dict[str, str]]:
+    """
+    Find spoken ranges that would convert into nonsense, and shield them.
+
+    "twenty two to three millimeter" converts word-by-word into "22 to 3 mm" -
+    a descending range no radiologist ever dictated. The real utterance was
+    "2 to 3 mm" or "22 to 23 mm", and this code cannot know which, so the
+    phrase is left exactly as spoken and flagged for the radiologist. A wrong
+    measurement is worse than an unconverted one - the same rule that keeps
+    "two fifty" out of the number parser.
+
+    Returns (masked_text, warnings, restore_map). Callers run the conversion
+    passes on the masked text, then swap the placeholders back.
+    """
+    warnings: list[Suggestion] = []
+    restore: dict[str, str] = {}
+
+    def replace(match: re.Match) -> str:
+        low = _words_to_number(match.group(1))
+        high = _words_to_number(match.group(2))
+        if low is None or high is None or float(low) < float(high):
+            return match.group(0)  # converts cleanly and ascends - leave it in
+        token = f"\x00RANGE{len(restore)}\x00"
+        restore[token] = match.group(0)
+        warnings.append(Suggestion(
+            heard=match.group(0),
+            suggested=f"ambiguous range - did you mean "
+                      f"{str(low)[:-1] or low} to {high} or {low} to "
+                      f"{str(low)[:-1]}{high}?",
+            confidence=0.0,
+            reason="range",
+        ))
+        return token
+
+    return _SPOKEN_RANGE.sub(replace, text), warnings, restore
+
+
+# --------------------------------------------------------------------------- #
+# Indic-English anchor vocabulary
+# --------------------------------------------------------------------------- #
+
+# Radiology terms that Indian-accent ASR reliably splits into two words. When
+# adjacent words concatenate (letter-for-letter) into one of these, joining
+# them changes no letters - so it is applied, and counted, not just suggested.
+ANCHOR_TERMS = (
+    "subcentimeter", "subcentimetric", "pneumothorax", "pneumonia",
+    "pneumoperitoneum", "hydronephrosis", "hydroureter", "cholelithiasis",
+    "cholecystitis", "choledocholithiasis", "hepatosplenomegaly",
+    "hepatomegaly", "splenomegaly", "cardiomegaly", "lymphadenopathy",
+    "spondylolisthesis", "spondylosis", "echotexture", "bronchiectasis",
+    "atelectasis", "consolidation", "retroperitoneal", "paraaortic",
+    "periportal", "pericholecystic", "perinephric", "endometrium",
+    "myometrium", "nephrolithiasis", "urolithiasis", "osteophytes",
+    "pleuropulmonary", "cardiothoracic", "costophrenic", "tracheobronchial",
+)
+
+# Mishearings where the letters ARE different - these are never applied,
+# only suggested, exactly like near_misses(). heard -> meant.
+ANCHOR_MISHEARINGS = {
+    "o capacity": "opacity",
+    "oh capacity": "opacity",
+    "new monia": "pneumonia",
+    "new mo thorax": "pneumothorax",
+    "numo thorax": "pneumothorax",
+    "colic list": "cholelithiasis",
+    "eco texture": "echotexture",
+    "a telecast is": "atelectasis",
+    "sub center meter": "subcentimeter",
+    "grade to": "grade two",
+}
+
+_ANCHOR_BY_JOIN = {t.lower(): t for t in ANCHOR_TERMS}
+
+
+def join_split_terms(text: str) -> tuple[str, int]:
+    """
+    Rejoin anchor terms the transcriber split: "hydro nephrosis" ->
+    "hydronephrosis". Safe to apply because the letters are identical -
+    nothing is rewritten, only a space removed.
+    """
+    changes = 0
+    tokens = re.split(r"(\s+)", text)
+    words = [(i, t) for i, t in enumerate(tokens) if t and not t.isspace()]
+    i = 0
+    while i < len(words) - 1:
+        merged = False
+        for span in (3, 2):  # try three-word joins first
+            if i + span - 1 >= len(words):
+                continue
+            parts = [words[i + k][1] for k in range(span)]
+            joined = "".join(parts).lower()
+            if joined in _ANCHOR_BY_JOIN:
+                first_index = words[i][0]
+                last_index = words[i + span - 1][0]
+                replacement = _ANCHOR_BY_JOIN[joined]
+                if parts[0][:1].isupper():
+                    replacement = replacement.capitalize()
+                tokens[first_index] = replacement
+                for j in range(first_index + 1, last_index + 1):
+                    tokens[j] = ""
+                changes += 1
+                words = [(k, t) for k, t in enumerate(tokens) if t and not t.isspace()]
+                merged = True
+                break
+        if not merged:
+            i += 1
+    return "".join(tokens), changes
+
+
+def anchor_suggestions(text: str) -> list[Suggestion]:
+    """Known Indic-accent mishearings present in the text. Suggested, never applied."""
+    out: list[Suggestion] = []
+    lowered = text.lower()
+    for heard, meant in ANCHOR_MISHEARINGS.items():
+        if re.search(r"\b" + re.escape(heard) + r"\b", lowered):
+            out.append(Suggestion(heard=heard, suggested=meant,
+                                  confidence=0.95, reason="anchor"))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 
 
 @dataclass
@@ -352,11 +533,12 @@ class Cleanup:
     text: str
     number_fixes: int = 0
     unit_fixes: int = 0
+    itn_fixes: int = 0
     suggestions: list[Suggestion] = None
 
     @property
     def changed(self) -> bool:
-        return bool(self.number_fixes or self.unit_fixes)
+        return bool(self.number_fixes or self.unit_fixes or self.itn_fixes)
 
     @property
     def note(self) -> str:
@@ -365,16 +547,33 @@ class Cleanup:
             bits.append(f"{self.number_fixes} spoken number(s) written as figures")
         if self.unit_fixes:
             bits.append(f"{self.unit_fixes} unit(s) normalised")
+        if self.itn_fixes:
+            bits.append(f"{self.itn_fixes} medical notation fix(es)")
         return " · ".join(bits)
 
 
 def clean(text: str, vocabulary: list[str] | None = None) -> Cleanup:
     """Everything above, in the right order."""
-    out, numbers = spoken_numbers(text)
+    # Shield ranges that would convert into nonsense BEFORE any conversion runs.
+    out, range_warnings, restore = protect_ambiguous_ranges(text)
+
+    out, numbers = spoken_numbers(out)
     out, unit_count = units(out)
+    out, compound_count = iso_units(out)
+    out, grade_count = grades(out)
+    out, join_count = join_split_terms(out)
+
+    for token, original in restore.items():
+        out = out.replace(token, original)
+
+    suggestions = near_misses(out, vocabulary or [])
+    suggestions.extend(anchor_suggestions(out))
+    suggestions.extend(range_warnings)
+
     return Cleanup(
         text=out,
         number_fixes=numbers,
         unit_fixes=unit_count,
-        suggestions=near_misses(out, vocabulary or []),
+        itn_fixes=compound_count + grade_count + join_count,
+        suggestions=suggestions,
     )

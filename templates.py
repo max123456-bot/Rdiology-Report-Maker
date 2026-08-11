@@ -111,6 +111,10 @@ class Template:
     # Answers the doctor has already given to clarifying questions, so the same
     # question is not asked twice.
     answered: dict[str, str] = field(default_factory=dict)
+    # Macros: a short dictated trigger (".normalchest") that expands into a
+    # complete block of this doctor's standard text. Per-doctor, on top of the
+    # built-in defaults in BUILTIN_MACROS.
+    macros: dict[str, str] = field(default_factory=dict)
     builtin: bool = False
 
     def style(self, kind: str) -> BlockStyle:
@@ -316,6 +320,9 @@ def from_dict(data: dict) -> Template:
         preferences=_texts(preferences)[-MAX_PREFERENCES:],
         answered={str(k): str(v) for k, v in dict(answered).items()}
         if isinstance(answered, dict) else {},
+        macros={str(k).strip(): str(v) for k, v in dict(fields.get("macros") or {}).items()
+                if str(k).strip() and str(v).strip()}
+        if isinstance(fields.get("macros"), dict) else {},
         vocabulary=_texts(vocabulary)[-MAX_VOCABULARY:],
         dictation_fixes=dictation_fixes[-MAX_DICTATION_FIXES:],
         styles=styles,
@@ -509,4 +516,95 @@ def learning_summary(template: Template) -> str:
         bits.append(f"{len(template.vocabulary)} dictation term(s)")
     if template.dictation_fixes:
         bits.append(f"{len(template.dictation_fixes)} mishearing(s) fixed")
+    if template.macros:
+        bits.append(f"{len(template.macros)} macro(s)")
     return " · ".join(bits) or "nothing learned yet"
+
+
+# --------------------------------------------------------------------------- #
+# Macros - dictated triggers that expand into standard text
+# --------------------------------------------------------------------------- #
+
+# Defaults every doctor gets. A doctor's own macro with the same trigger wins.
+# Triggers start with "." so ordinary prose can never expand by accident.
+BUILTIN_MACROS: dict[str, str] = {
+    ".normalchest": (
+        "FINDINGS:\n"
+        "Both lung fields are clear. No focal parenchymal lesion.\n"
+        "Cardiac size and mediastinal contours are within normal limits.\n"
+        "Both costophrenic angles are free. No pleural effusion or pneumothorax.\n"
+        "Visualised bony thorax and soft tissues are unremarkable.\n\n"
+        "IMPRESSION:\n"
+        "No significant abnormality detected in the present chest radiograph."
+    ),
+    ".normalabdomen": (
+        "FINDINGS:\n"
+        "Liver is normal in size and echotexture. No focal lesion.\n"
+        "Gallbladder is normal. No calculus. CBD is not dilated.\n"
+        "Pancreas and spleen are normal.\n"
+        "Both kidneys are normal in size, shape and echotexture. "
+        "No calculus or hydronephrosis.\n"
+        "Urinary bladder is normal. No free fluid in the abdomen.\n\n"
+        "IMPRESSION:\n"
+        "No significant abnormality detected in the present study."
+    ),
+    ".normalbrainct": (
+        "FINDINGS:\n"
+        "Brain parenchyma shows normal attenuation. No focal lesion.\n"
+        "No evidence of intracranial haemorrhage, mass effect or midline shift.\n"
+        "Ventricular system and basal cisterns are normal.\n"
+        "Visualised paranasal sinuses and bony calvarium are unremarkable.\n\n"
+        "IMPRESSION:\n"
+        "No significant abnormality detected in the present CT study of the brain."
+    ),
+}
+
+_MACRO_TRIGGER = re.compile(r"(?<![\w.])\.[a-z][a-z0-9_]{2,}\b")
+
+
+def expand_macros(text: str, template: Template | None = None) -> tuple[str, list[str]]:
+    """
+    Expand every macro trigger in the text. Returns (expanded, triggers_used).
+
+    The doctor's own macros override the built-ins. Unknown triggers are left
+    exactly as typed - flagging them is validate.py's placeholder check's job,
+    and silently deleting text is nobody's job.
+    """
+    table = dict(BUILTIN_MACROS)
+    if template is not None:
+        for trigger, body in (template.macros or {}).items():
+            key = trigger if trigger.startswith(".") else f".{trigger}"
+            table[key.lower()] = body
+
+    used: list[str] = []
+
+    def replace(match: re.Match) -> str:
+        trigger = match.group(0).lower()
+        if trigger in table:
+            used.append(trigger)
+            return table[trigger]
+        return match.group(0)
+
+    return _MACRO_TRIGGER.sub(replace, text), used
+
+
+def remember_macro(template: Template, trigger: str, body: str) -> Template:
+    """Store one macro on the doctor's template. Trigger is normalised to '.x'."""
+    key = trigger.strip().lower()
+    if not key.startswith("."):
+        key = f".{key}"
+    if len(key) < 4:
+        raise ValueError("A macro trigger needs at least three letters after the dot.")
+    if not body.strip():
+        raise ValueError("A macro needs body text to expand into.")
+    updated = copy_of(template, template.name, doctor=template.doctor)
+    updated.macros = dict(template.macros or {})
+    updated.macros[key] = body.strip()
+    return updated
+
+
+def forget_macro(template: Template, trigger: str) -> Template:
+    updated = copy_of(template, template.name, doctor=template.doctor)
+    updated.macros = {k: v for k, v in (template.macros or {}).items()
+                      if k != trigger.strip().lower()}
+    return updated

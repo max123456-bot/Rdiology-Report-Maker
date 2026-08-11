@@ -27,3 +27,9 @@ templates/_events.jsonl
 
 # Backups pulled down from hosting
 backups/
+
+# DICOM received from modalities - patient data, never committed
+incoming_dicom/
+
+# Saved report records (patient data) on the file store
+templates/_reports/

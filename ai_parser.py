@@ -190,7 +190,7 @@ def draft_with_questions(
     from google.genai import types
 
     client = _client(api_key)
-    response = client.models.generate_content(
+    response = _generate(client,
         model=model,
         contents=[build_draft_prompt(template, raw_notes, section, answers)],
         config=types.GenerateContentConfig(
@@ -213,8 +213,17 @@ def draft_with_questions(
                 "options": [str(o).strip() for o in (q.get("options") or []) if str(o).strip()],
             }
         )
+    draft = str(data.get("draft") or "").strip()
+
+    # The negation tripwire. A rough-notes negative that the model asserted is
+    # a patient-safety event, not a style problem - stop hard, never return
+    # the draft. (negation.NegationMismatchException)
+    import negation
+
+    negation.assert_polarity(raw_notes, draft)
+
     return {
-        "draft": str(data.get("draft") or "").strip(),
+        "draft": draft,
         "questions": questions,
         "assumptions": [str(a).strip() for a in (data.get("assumptions") or []) if str(a).strip()],
     }
@@ -260,7 +269,7 @@ def distill_preferences(
     body.append(f"--- {doctor.upper()}'S CORRECTED VERSION ---\n{after}")
 
     client = _client(api_key)
-    response = client.models.generate_content(
+    response = _generate(client,
         model=model,
         contents=["\n\n".join(body)],
         config=types.GenerateContentConfig(
@@ -417,7 +426,7 @@ def transcribe_dictation(
     from google.genai import types
 
     client = _client(api_key)
-    response = client.models.generate_content(
+    response = _generate(client,
         model=model,
         contents=[
             types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
@@ -515,7 +524,7 @@ def structure_dictation(
     body.append(f"--- RAW SPEECH RECOGNISER OUTPUT ---\n{raw_text.strip()}")
 
     client = _client(api_key)
-    response = client.models.generate_content(
+    response = _generate(client,
         model=model,
         contents=["\n\n".join(body)],
         config=types.GenerateContentConfig(
@@ -573,7 +582,7 @@ def transcribe_repeat(
         "no commentary, no punctuation you did not hear dictated. If it is still not clear, "
         "return exactly: UNCLEAR"
     )
-    response = client.models.generate_content(
+    response = _generate(client,
         model=model,
         contents=[
             types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
@@ -644,7 +653,7 @@ def review_transcript(
         body.append("Mistakes made for this radiologist before:\n" + "\n".join(fixes))
 
     client = _client(api_key)
-    response = client.models.generate_content(
+    response = _generate(client,
         model=model,
         contents=["\n\n".join(body)],
         config=types.GenerateContentConfig(
@@ -681,7 +690,7 @@ def distill_vocabulary(
     from google.genai import types
 
     client = _client(api_key)
-    response = client.models.generate_content(
+    response = _generate(client,
         model=model,
         contents=[
             "A radiology dictation was transcribed, then corrected by the radiologist.\n\n"
@@ -728,10 +737,55 @@ def list_models(api_key: str) -> list[str]:
     return names
 
 
+REQUEST_TIMEOUT_MS = 60_000
+_RETRY_ATTEMPTS = 3
+_TRANSIENT_MARKERS = ("429", "500", "502", "503", "504", "timeout", "deadline",
+                      "unavailable", "resource exhausted", "internal error",
+                      "connection", "temporarily")
+
+
 def _client(api_key: str):
     from google import genai
 
-    return genai.Client(api_key=api_key)
+    try:
+        from google.genai import types
+
+        return genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
+        )
+    except Exception:
+        # An SDK version without HttpOptions still gets a working client -
+        # only the explicit timeout is lost, not the feature.
+        return genai.Client(api_key=api_key)
+
+
+def _generate(client, *, model, contents, config):
+    """
+    One model call with retries.
+
+    Transient failures (rate limits, 5xx, dropped connections) are retried
+    with exponential backoff and jitter; anything else - a bad key, a safety
+    block, a malformed request - raises immediately, because retrying it
+    would only repeat the same failure slower.
+    """
+    import random
+    import time
+
+    last_exc: Exception | None = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            return client.models.generate_content(
+                model=model, contents=contents, config=config
+            )
+        except Exception as exc:
+            last_exc = exc
+            message = str(exc).lower()
+            transient = any(marker in message for marker in _TRANSIENT_MARKERS)
+            if not transient or attempt == _RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep((2 ** attempt) * 0.5 + random.uniform(0, 0.25))
+    raise last_exc  # unreachable, keeps type-checkers honest
 
 
 def _config(temperature: float = 0.0):
@@ -747,7 +801,7 @@ def _config(temperature: float = 0.0):
 def structure_with_ai(raw_text: str, api_key: str, model: str) -> list[Block]:
     """Classify raw report text into Blocks using Gemini. Raises on failure."""
     client = _client(api_key)
-    response = client.models.generate_content(
+    response = _generate(client,
         model=model,
         contents=[f"RAW REPORT:\n{raw_text}"],
         config=_config(),
@@ -762,7 +816,7 @@ def extract_text_from_file(
     from google.genai import types
 
     client = _client(api_key)
-    response = client.models.generate_content(
+    response = _generate(client,
         model=model,
         contents=[
             types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
@@ -773,6 +827,219 @@ def extract_text_from_file(
         config=types.GenerateContentConfig(temperature=0.0),
     )
     return (response.text or "").strip()
+
+
+def build_impression_prompt(findings_text: str, template=None) -> str:
+    """
+    The auto-impression prompt. Pure text, no network - testable offline.
+
+    The findings are the only source of truth. The model may compress and
+    reorder, but a finding, number or laterality that is not in the findings
+    must not appear in the impression - validate.py will catch it anyway, so
+    the prompt says it up front.
+    """
+    parts: list[str] = [
+        "You draft the IMPRESSION section of a radiology report from its FINDINGS.",
+        "",
+        "Rules:",
+        "- Every impression point must come from the findings below. Never add a "
+        "finding, a measurement, a number or a laterality that is not there.",
+        "- Lead with the clinically most important finding.",
+        "- One short point per finding. Omit normal findings unless the study is "
+        "entirely normal, in which case the impression is exactly one line saying so.",
+        "- Use standard academic radiology phrasing.",
+    ]
+    if template is not None:
+        preferences = [p.strip() for p in (getattr(template, "preferences", None) or []) if p.strip()]
+        if preferences:
+            parts.append("\nHouse rules from this radiologist:")
+            parts.extend(f"- {rule}" for rule in preferences)
+        notes = (getattr(template, "style_notes", "") or "").strip()
+        if notes:
+            parts.append(f"\nHouse-style notes:\n{notes}")
+    parts.append(
+        "\nReturn JSON only:\n"
+        '{"impression": ["first point", "second point"]}'
+    )
+    parts.append(f"\n--- FINDINGS ---\n{findings_text.strip()}")
+    return "\n".join(parts)
+
+
+def draft_impression(
+    findings_text: str, api_key: str, model: str, template=None
+) -> list[str]:
+    """
+    Ask the model for impression bullets from the findings. Raises on failure;
+    the caller falls back to impression.propose_from_findings(), which never
+    fails and never invents.
+    """
+    import json as _json
+
+    from google.genai import types
+
+    client = _client(api_key)
+    response = _generate(client,
+        model=model,
+        contents=[build_impression_prompt(findings_text, template)],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.0,
+        ),
+    )
+    data = _json.loads(response.text or "{}")
+    out = [str(p).strip().rstrip(".") for p in (data.get("impression") or []) if str(p).strip()]
+    if not out:
+        raise ValueError("Model returned no impression points.")
+
+    # Negation tripwire: a finding the findings negated must not be asserted
+    # in the impression. Omission is fine here - an impression summarises.
+    import negation
+
+    negation.assert_polarity(findings_text, "\n".join(out))
+
+    return out
+
+
+PREFILL_PROMPT = """You are a radiology pre-read assistant. You are shown a medical image
+(an X-ray, or a photographed film). Draft preliminary FINDINGS a radiologist will review.
+
+Rules:
+- Describe only what is visibly present. If a region is not assessable, say so.
+- Use standard academic radiology phrasing, organised by structure.
+- Never state a measurement you cannot actually make from the image.
+- End with the single line: "Preliminary AI pre-read - requires radiologist review."
+- If the image is not a medical image, say exactly that and nothing else.
+
+Return JSON only:
+{"findings": "the draft findings text, one finding per line",
+ "confidence": "high|medium|low",
+ "caveats": ["anything limiting the read - rotation, exposure, cropped anatomy"]}"""
+
+
+def build_prefill_prompt(context: str = "") -> str:
+    """The scan pre-read instruction, with any study context appended."""
+    if context.strip():
+        return PREFILL_PROMPT + f"\n\nStudy context from the requisition: {context.strip()}"
+    return PREFILL_PROMPT
+
+
+def prefill_from_scan(
+    file_bytes: bytes, mime_type: str, api_key: str, model: str, context: str = ""
+) -> dict:
+    """
+    The "bionic pre-read": draft findings from an actual scan image.
+
+    Returns {"findings": str, "confidence": str, "caveats": [str]}. The draft
+    lands in the editor as a suggestion; it is never sent anywhere without the
+    radiologist rewriting or approving it, and the word-loss audit applies to
+    whatever they finally approve, exactly as with typed text.
+    """
+    import json as _json
+
+    from google.genai import types
+
+    client = _client(api_key)
+    response = _generate(client,
+        model=model,
+        contents=[
+            types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+            build_prefill_prompt(context),
+        ],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.0,
+        ),
+    )
+    data = _json.loads(response.text or "{}")
+    findings = str(data.get("findings") or "").strip()
+    if not findings:
+        raise ValueError("Model returned no findings.")
+    return {
+        "findings": findings,
+        "confidence": str(data.get("confidence") or "low").strip().lower(),
+        "caveats": [str(c).strip() for c in (data.get("caveats") or []) if str(c).strip()],
+    }
+
+
+def draft_impression_from_findings(
+    findings_text: str, template=None, api_key: str = "", model: str = ""
+) -> list[str]:
+    """
+    Impression bullets, fast path first.
+
+    The deterministic engine (impression.py) answers in microseconds and
+    never invents a word - that is the sub-second guarantee. When a key and
+    model are given, the AI draft is attempted on top and used only if it
+    passes the negation tripwire; any AI failure falls back to the
+    deterministic result instead of surfacing an error.
+    """
+    import impression
+
+    deterministic = impression.propose_from_findings(findings_text)
+    if not deterministic:
+        normal = impression.normal_study_line(findings_text)
+        deterministic = [normal] if normal else []
+
+    if api_key and model:
+        try:
+            return draft_impression(findings_text, api_key, model, template)
+        except Exception:
+            pass  # includes NegationMismatchException - deterministic wins
+    return deterministic
+
+
+SECOND_OPINION_PROMPT = """You are a radiology report safety checker. You are given a complete
+report. Deterministic rule checks have already run; you are the second
+opinion for what rules cannot see - clinical sense, internal consistency,
+findings that contradict the impression in meaning rather than in words.
+
+Judge ONLY what is in the text. Do not invent findings, do not suggest
+alternative diagnoses, do not rewrite anything.
+
+Return JSON only, exactly this shape:
+{"safe_to_send": true,
+ "issues": [{"severity": "critical|warning|note",
+             "title": "short statement of the problem",
+             "detail": "one or two sentences, quoting the text"}]}
+
+An empty issues list with safe_to_send true is a normal answer."""
+
+
+def second_opinion(report_text: str, api_key: str, model: str) -> dict:
+    """
+    The escalation tier of the hybrid validation pipeline: deterministic
+    checks first (validate.py, ~ms), this model pass only when the user asks.
+    Returns {"safe_to_send": bool, "issues": [{severity,title,detail}]}.
+    """
+    import json as _json
+
+    from google.genai import types
+
+    client = _client(api_key)
+    response = _generate(client,
+        model=model,
+        contents=[f"REPORT:\n{report_text.strip()}"],
+        config=types.GenerateContentConfig(
+            system_instruction=SECOND_OPINION_PROMPT,
+            response_mime_type="application/json",
+            temperature=0.0,
+        ),
+    )
+    data = _json.loads(response.text or "{}")
+    issues = []
+    for item in data.get("issues") or []:
+        if not isinstance(item, dict):
+            continue
+        severity = str(item.get("severity") or "note").lower()
+        if severity not in ("critical", "warning", "note"):
+            severity = "note"
+        title = str(item.get("title") or "").strip()
+        if not title:
+            continue
+        issues.append({"severity": severity, "title": title,
+                       "detail": str(item.get("detail") or "").strip()})
+    return {"safe_to_send": bool(data.get("safe_to_send", not issues)),
+            "issues": issues}
 
 
 def _blocks_from_json(payload: str) -> list[Block]:
