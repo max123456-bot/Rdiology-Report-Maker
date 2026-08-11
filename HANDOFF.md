@@ -17,10 +17,10 @@ streamlit run app.py
 ```
 
 ```bash
-python selftest.py && python edge_check.py && python integration_check.py && python security_check.py && python storage_check.py && python clinical_check.py && python interop_check.py && python pacs_check.py && python master_check.py && python enterprise_check.py
+python selftest.py && python edge_check.py && python integration_check.py && python security_check.py && python storage_check.py && python clinical_check.py && python interop_check.py && python pacs_check.py && python master_check.py && python enterprise_check.py && python parsing_check.py
 ```
 
-All ten pass. All offline — no key, no network (pacs/enterprise checks use only loopback).
+All eleven pass. All offline — no key, no network (pacs/enterprise checks use only loopback).
 
 The processing engine is also a service:  `uvicorn api:app` exposes parse /
 validate / triage / guidelines / impression / audit / hl7 / fhir over REST
@@ -61,6 +61,9 @@ for RIS integration, without touching the Streamlit UI.
 | RBAC (`access.py`) | Roles via `ROLE_MAP`/`ROLE_DEFAULT`; unconfigured = everyone attending (solo-clinic behaviour). Only attending signs; signing past a critical flag demands a written justification, recorded on the trail and in the audit log. |
 | Signatures (`verify.py`) | With `ATTEST_KEY`: HMAC-SHA256 over each signed report's exact text + a signed attestation chain — non-repudiation, not just integrity. |
 | MWL / DICOMweb (`pacs.py`) | Modality Worklist C-FIND (pick the scheduled patient instead of typing), QIDO-RS study search and WADO-RS instance fetch via `DICOMWEB_URL`. |
+| `anatomy.py` | Findings as a REGION → ORGAN → SUBPART tree plus deterministic coreference ("It measures 2.5 cm" attaches to the organ in context). A structured VIEW — the document text is never touched. |
+| Self-correction flag (`validate.py`) | "…12 mm mass, wait, left kidney…" is flagged critical: no software may pick a half, the human reviews. |
+| Table reconstruction (`readers.py`) | pdfplumber rebuilds echo/lab grids as `Header: value` lines, clearly marked, deletable. |
 | `editor/`, `live_dictate/` | Self-contained Streamlit components, plain HTML/JS, no build step. |
 
 ## Three things needing the user, not code

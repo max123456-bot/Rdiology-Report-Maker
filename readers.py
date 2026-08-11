@@ -95,7 +95,85 @@ def read_pdf(data: bytes) -> str:
     text = "\n".join(pages).strip()
     if len(text) < 40:
         raise NeedsOCR("This PDF looks like a scan - no text layer found.")
+
+    tables = pdf_tables(data)
+    if tables:
+        # A plain text extractor shreds a table's rows into word soup; the
+        # reconstructed key-value lines below carry the SAME values with
+        # their headers reattached. Clearly marked, so the user deletes the
+        # section if the loose extraction already read fine.
+        text += ("\n\n[TABLES RECONSTRUCTED - the same values as above with "
+                 "their column headers reattached; delete this section if "
+                 "the text above already reads correctly]\n"
+                 + tables_to_text(tables))
     return text
+
+
+def pdf_tables(data: bytes) -> list[list[list[str]]]:
+    """
+    Tables detected in the PDF, as rows of cells. Echo and lab reports keep
+    their measurements (EF, LVIDd...) in grids that plain text extraction
+    destroys. Empty list when pdfplumber is absent or finds nothing - the
+    text path above never depends on this.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        return []
+    tables: list[list[list[str]]] = []
+    try:
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            for page in pdf.pages:
+                for table in page.extract_tables() or []:
+                    rows = [[(cell or "").strip() for cell in row]
+                            for row in table if row]
+                    rows = [r for r in rows if any(r)]
+                    if len(rows) >= 2 and max(len(r) for r in rows) >= 2:
+                        tables.append(rows)
+    except Exception:
+        return []  # a broken table layer must not break the text path
+    return tables
+
+
+def tables_to_text(tables: list[list[list[str]]]) -> str:
+    """
+    Rows of cells to readable lines.
+
+    Two-column tables are key-value pairs ("EF: 62 %"). Wider tables get the
+    header reattached to every cell ("LVIDd: 4.8 cm · LVIDs: 3.1 cm"), so a
+    value never floats free of its meaning.
+    """
+    blocks: list[str] = []
+    for table in tables:
+        lines: list[str] = []
+        width = max(len(row) for row in table)
+        if width == 2:
+            for row in table:
+                key = (row[0] or "").strip()
+                value = (row[1] if len(row) > 1 else "").strip()
+                if key and value:
+                    lines.append(f"{key}: {value}")
+                elif key or value:
+                    lines.append(key or value)
+        else:
+            header = [c.strip() for c in table[0]]
+            has_header = sum(1 for c in header if c) >= 2 and not any(
+                ch.isdigit() for c in header for ch in c
+            )
+            body = table[1:] if has_header else table
+            for row in body:
+                cells = []
+                for i, cell in enumerate(row):
+                    cell = (cell or "").strip()
+                    if not cell:
+                        continue
+                    name = header[i] if has_header and i < len(header) and header[i] else ""
+                    cells.append(f"{name}: {cell}" if name else cell)
+                if cells:
+                    lines.append(" · ".join(cells))
+        if lines:
+            blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
 
 
 def read_any(filename: str, data: bytes) -> str:

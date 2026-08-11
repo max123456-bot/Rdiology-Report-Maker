@@ -24,6 +24,10 @@ pynetdicom>=2.0
 # threshold. Headless build - no GUI libraries dragged in.
 opencv-python-headless>=4.8
 
+# Table reconstruction in text-layer PDFs (echo/lab value grids). The plain
+# text path works without it.
+pdfplumber>=0.11
+
 # Free local OCR tier. Needs the tesseract binary too: packages.txt installs
 # tesseract-ocr on Streamlit Cloud; Windows uses the UB Mannheim installer.
 # The app degrades to Gemini Vision when either piece is absent.

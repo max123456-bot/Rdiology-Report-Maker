@@ -40,6 +40,9 @@ class RadiologyReportSchema(BaseModel):
     clinical_history: str = ""
     technique: str = ""
     findings: Dict[str, str] = Field(default_factory=dict)  # organ/system -> text
+    # REGION -> ORGAN -> SUBPART -> [sentences]; anatomy.findings_tree - a
+    # structured VIEW of the findings, never a rewrite of them.
+    findings_tree: Dict = Field(default_factory=dict)
     impression: List[ImpressionItem] = Field(default_factory=list)
 
     @field_validator("findings")
@@ -105,11 +108,15 @@ def report_from_blocks(blocks) -> RadiologyReportSchema:
             is_critical=triaged.level == "stat",
         ))
 
+    import anatomy
+
+    findings_text = "\n".join(line for lines in findings.values() for line in lines)
     return RadiologyReportSchema(
         study=study,
         clinical_history=" ".join(history),
         technique=" ".join(technique),
         findings={k: " ".join(v) for k, v in findings.items()},
+        findings_tree=anatomy.findings_tree(findings_text),
         impression=items,
     )
 

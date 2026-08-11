@@ -461,6 +461,34 @@ ANCHOR_TERMS = (
     "pleuropulmonary", "cardiothoracic", "costophrenic", "tracheobronchial",
 )
 
+# A core radiology lexicon (RadLex-style), so the near-miss suggester works
+# from day one, before any doctor has taught the app their vocabulary.
+# "cholelithisis" gets its suggestion even with an empty template. SUGGEST
+# ONLY, like everything in this file - auto-correcting a medical term is how
+# a wrong word reaches a report, and that rule does not bend for a lexicon.
+RADLEX_CORE = (
+    "cholelithiasis", "cholecystitis", "choledocholithiasis", "cholangitis",
+    "hepatomegaly", "splenomegaly", "hepatosplenomegaly", "cardiomegaly",
+    "hydronephrosis", "hydroureter", "nephrolithiasis", "urolithiasis",
+    "pyelonephritis", "cystitis", "diverticulitis", "diverticulosis",
+    "appendicitis", "pancreatitis", "lymphadenopathy", "mesenteric",
+    "retroperitoneal", "pneumothorax", "pneumonia", "pneumoperitoneum",
+    "atelectasis", "bronchiectasis", "consolidation", "cardiothoracic",
+    "costophrenic", "pleural effusion", "pericardial effusion",
+    "pleuropulmonary", "mediastinal", "hilar", "spondylolisthesis",
+    "spondylosis", "scoliosis", "kyphosis", "osteophytes", "sacroiliitis",
+    "haemangioma", "hemangioma", "lipoma", "fibroadenoma", "adenomyosis",
+    "endometrioma", "leiomyoma", "hydrosalpinx", "varicocele", "hydrocele",
+    "epididymitis", "orchitis", "prostatomegaly", "echotexture", "echogenic",
+    "hypoechoic", "hyperechoic", "anechoic", "heterogeneous", "homogeneous",
+    "corticomedullary", "parenchymal", "periportal", "pericholecystic",
+    "perinephric", "subcapsular", "intraparenchymal", "extraaxial",
+    "hydrocephalus", "leukoaraiosis", "gliosis", "demyelination",
+    "meningioma", "schwannoma", "metastasis", "metastases", "lytic",
+    "sclerotic", "osteopenia", "osteoporosis", "subcentimeter",
+    "supraclavicular", "paratracheal", "paraaortic", "subcarinal",
+)
+
 # Mishearings where the letters ARE different - these are never applied,
 # only suggested, exactly like near_misses(). heard -> meant.
 ANCHOR_MISHEARINGS = {
@@ -566,7 +594,9 @@ def clean(text: str, vocabulary: list[str] | None = None) -> Cleanup:
     for token, original in restore.items():
         out = out.replace(token, original)
 
-    suggestions = near_misses(out, vocabulary or [])
+    # The doctor's own terms first (they win on duplicates inside
+    # near_misses), then the built-in radiology lexicon.
+    suggestions = near_misses(out, list(vocabulary or []) + list(RADLEX_CORE))
     suggestions.extend(anchor_suggestions(out))
     suggestions.extend(range_warnings)
 

@@ -317,6 +317,34 @@ def check_laterality(sections: dict[str, list[str]], report: Report) -> None:
             ))
 
 
+# Words that mean the doctor corrected themselves MID-DICTATION and the
+# correction was transcribed along with the mistake. "Right kidney shows a
+# 12 mm mass, wait, left kidney..." - no parser can decide which half was
+# meant, and guessing is the one thing this system never does. The human
+# reviews; that is the whole flag.
+_SELF_CORRECTION = re.compile(
+    r"\bwait\b|\bsorry\b|\bcorrection\b|\bscratch that\b|\bcancel that\b|"
+    r"\bignore that\b|\bdelete that\b|\bi mean\b|\bactually no\b|\bno no\b|"
+    r"\bstrike that\b|\brather\b,",
+    re.I,
+)
+
+
+def check_self_corrections(blocks, report: Report) -> None:
+    for b in blocks:
+        text = f"{b.text} {b.trailer}".strip()
+        hit = _SELF_CORRECTION.search(text)
+        if hit:
+            report.findings.append(Finding(
+                "critical",
+                f"Dictation self-correction left in the text: “{hit.group(0).strip()}”",
+                "The doctor corrected themselves mid-sentence and both halves were "
+                "transcribed. No software can safely decide which half was meant - "
+                "edit the line to say only the corrected version.",
+                b.section or b.kind,
+            ))
+
+
 def check_leftovers(blocks, report: Report) -> None:
     for b in blocks:
         text = f"{b.text} {b.trailer}".strip()
@@ -522,6 +550,7 @@ def validate(blocks) -> Report:
     check_impression_measurements(sections, report)
     check_laterality(sections, report)
     check_leftovers(blocks, report)
+    check_self_corrections(blocks, report)
     check_contradictions(sections, report)
     check_impression_length(sections, report)
     check_modality_rules(sections, report)

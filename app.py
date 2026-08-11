@@ -910,10 +910,30 @@ with tab_single:
 
     raw_text = ""
     if source == "Paste text":
+        # Text injected by other features (macros, the scan pre-read) arrives
+        # via "prefill"; with a keyed widget it must land in the widget's own
+        # state, before the widget is instantiated.
+        if "prefill" in st.session_state:
+            st.session_state["paste_input"] = st.session_state.pop("prefill")
+
+        label_col, clear_col = st.columns([5, 1])
+        with label_col:
+            st.markdown("Paste the raw report exactly as the boss sent it")
+        with clear_col:
+            if st.button(":material/backspace: Clear", width="stretch",
+                         help="Empty the box for a fresh paste. The live "
+                              "preview and its edits reset too.",
+                         disabled=not st.session_state.get("paste_input", "").strip()):
+                st.session_state["paste_input"] = ""
+                st.session_state["editor_resets"] = \
+                    st.session_state.get("editor_resets", 0) + 1
+                st.rerun()
+
         raw_text = st.text_area(
             "Paste the raw report exactly as the boss sent it",
-            value=st.session_state.pop("prefill", ""),
+            key="paste_input",
             height=340,
+            label_visibility="collapsed",
             placeholder="MRI BRAIN WITH CONTRAST REPORT\n\nPATIENT NAME: ...\nAGE/SEX: ...\n"
             "CLINICAL HISTORY: ...\nTECHNIQUE: ...\n\nFINDINGS:\nBrain parenchyma:\n"
             "...\n\nIMPRESSION:\n...",

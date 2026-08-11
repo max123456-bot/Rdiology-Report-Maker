@@ -72,19 +72,35 @@ def extract_measurements(text: str) -> list[dict]:
     One entry per anatomy key, first mention wins - the first statement of an
     organ's size is almost always the measurement, later mentions are prose.
     Sizes are normalised to millimetres, the largest dimension of "a x b x c".
+
+    Anaphora carry-forward: "A cyst is seen in the left kidney. It measures
+    2.5 cm." puts the size in a sentence with no anatomy at all. A sentence
+    with dimensions but no anatomy inherits the PREVIOUS sentence's anatomy -
+    that is how dictation continues a topic, and losing the measurement was
+    worse than the mild assumption.
     """
     out: list[dict] = []
     seen: set[str] = set()
+    previous_key = ""
     for sentence in _sentences(text):
         anatomy_match = _ANATOMY_RE.search(sentence)
         dims_match = _DIMS_RE.search(sentence)
-        if not anatomy_match or not dims_match:
+
+        if anatomy_match:
+            side = (anatomy_match.group(1) or "").lower().rstrip(".")
+            side = _SIDE.get(side, side)
+            organ = anatomy_match.group(2).lower()
+            key = f"{side} {organ}".strip()
+            via = "stated"
+        elif dims_match and previous_key:
+            key = previous_key       # the sentence continues the last topic
+            via = "anaphora"
+        else:
             continue
-        side = (anatomy_match.group(1) or "").lower().rstrip(".")
-        side = _SIDE.get(side, side)
-        organ = anatomy_match.group(2).lower()
-        key = f"{side} {organ}".strip()
-        if key in seen:
+
+        if anatomy_match:
+            previous_key = key
+        if not dims_match or key in seen:
             continue
         values = [float(v) for v in dims_match.groups()[:3] if v]
         unit = dims_match.group(4).lower()
@@ -95,6 +111,7 @@ def extract_measurements(text: str) -> list[dict]:
             "size_mm": round(size_mm, 1),
             "stated": dims_match.group(0),
             "sentence": sentence[:160],
+            "via": via,
         })
     return out
 
