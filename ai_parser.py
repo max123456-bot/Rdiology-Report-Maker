@@ -139,7 +139,31 @@ def build_draft_prompt(
     # label, a model handed three lines of shorthand happily returns an
     # impression when the whole report was asked for.
     scope = (section or "").lower()
-    if "instruction" in scope:
+    if "informative" in scope or "diagnosis" in scope:
+        parts.append(
+            "\nSCOPE - AN INFORMATIVE REPORT FOR A DIAGNOSIS. The text below "
+            "names a diagnosis or a brief clinical scenario, possibly in a "
+            "single word. Write a COMPLETE, INFORMATIVE report describing the "
+            "TYPICAL imaging findings of that condition, in full academic "
+            "sentences:\n"
+            "- choose the study that condition is normally evaluated with and "
+            "title the report accordingly\n"
+            "- FINDINGS: organ by organ, describing the CLASSIC appearances of "
+            "the condition in proper descriptive sentences (for renal failure "
+            "on ultrasound: raised cortical echogenicity, reduced "
+            "corticomedullary differentiation, cortical thinning, and so on), "
+            "plus standard normal descriptions for the other organs the study "
+            "routinely covers\n"
+            "- wherever a patient-specific value belongs - a size, a "
+            "measurement, a grade, a count - write a bracketed placeholder "
+            "such as [SIZE mm] or [GRADE]; NEVER invent a specific number\n"
+            "- IMPRESSION: numbered points naming the condition and its "
+            "typical severity markers\n"
+            "- end with exactly this line: TEMPLATE DRAFT - typical findings "
+            "for the stated diagnosis. Verify every line against the actual "
+            "images before use."
+        )
+    elif "instruction" in scope:
         parts.append(
             "\nSCOPE - GENERATE FROM INSTRUCTIONS. The text below is the "
             "radiologist's INSTRUCTIONS for the report they want - not findings "

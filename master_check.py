@@ -163,6 +163,15 @@ result = validate.validate(brackets.blocks)
 check(any("Unfilled template bracket" in f.title for f in result.findings),
       "[INSERT MEASUREMENT] is caught")
 
+caps = parse_report(
+    "USG KUB REPORT\n\nFINDINGS:\nThe right kidney measures "
+    "[RIGHT KIDNEY LENGTH cm] in length.\n\nIMPRESSION:\n- Medical renal disease."
+)
+result = validate.validate(caps.blocks)
+check(any("Unfilled template bracket" in f.title and f.severity == "critical"
+          for f in result.findings),
+      "a diagnosis-mode caps placeholder blocks signing until filled")
+
 mammo = parse_report(
     "MAMMOGRAPHY REPORT\n\nFINDINGS:\nAn irregular mass in the left breast.\n\n"
     "IMPRESSION:\n- Suspicious left breast mass."
@@ -394,6 +403,14 @@ check("GENERATE FROM INSTRUCTIONS" in scope_prompt
       and "never invent" in scope_prompt
       and "THE RADIOLOGIST'S INSTRUCTIONS" in scope_prompt,
       "the instructions scope generates a full report and forbids invention")
+scope_prompt = ai_parser.build_draft_prompt(
+    _tpl, "kidney failure",
+    "an informative report for a diagnosis - even a single word")
+check("INFORMATIVE REPORT FOR A DIAGNOSIS" in scope_prompt
+      and "NEVER invent a specific number" in scope_prompt
+      and "TEMPLATE DRAFT" in scope_prompt,
+      "the diagnosis scope demands typical findings, placeholders, and the "
+      "template disclaimer")
 
 started = time.perf_counter()
 points = ai_parser.draft_impression_from_findings(

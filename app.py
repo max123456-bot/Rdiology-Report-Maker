@@ -2947,18 +2947,25 @@ with tab_draft:
             section = st.selectbox(
                 "What should the AI do with it?",
                 ["a full report from my instructions",
+                 "an informative report for a diagnosis - even a single word: "
+                 "typical findings in full sentences, [PLACEHOLDERS] for the "
+                 "patient's own measurements",
                  "the whole report", "the FINDINGS only", "the IMPRESSION only",
                  "shorthand expansion only - expand the abbreviations verbatim, "
                  "keep my wording and order exactly as written"],
                 format_func=lambda s: s.split(" - ")[0],
                 help="**From my instructions**: tell the AI what report you want "
                      "('Normal USG abdomen, 40F, grade I fatty liver, rest normal') "
-                     "and it writes the whole thing - stated facts only, standard "
-                     "normal phrases for the rest. The other modes REWRITE your "
-                     "shorthand notes instead of generating; narrower is safer, "
-                     "and *shorthand expansion* restyles nothing.",
+                     "and it writes the whole thing - stated facts only. "
+                     "**For a diagnosis**: type even one word ('kidney failure') "
+                     "and it writes the condition's TYPICAL findings in full "
+                     "descriptive sentences, with [PLACEHOLDERS] where the "
+                     "patient's own measurements belong - the checks refuse to "
+                     "sign until every placeholder is filled. The remaining "
+                     "modes REWRITE your shorthand notes; narrower is safer.",
             )
-            instruction_mode = section.startswith("a full report")
+            instruction_mode = section.startswith(("a full report",
+                                                   "an informative report"))
             # Keyed, not value=-seeded: an unkeyed text_area derives its
             # identity from the value parameter, so every generation rebuilt
             # the widget and could silently revert the doctor's edits.

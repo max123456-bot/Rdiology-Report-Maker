@@ -79,6 +79,10 @@ _BRACKET_PLACEHOLDER = re.compile(
     r"size|date|name)?\s*\](?!\])",
     re.I,
 )
+# ALL-CAPS bracket placeholders - the shape the diagnosis drafting mode emits
+# on purpose ([RIGHT KIDNEY LENGTH cm], [GRADE]) so a template draft cannot
+# be signed until every one is replaced with the patient's own value.
+_CAPS_PLACEHOLDER = re.compile(r"(?<!\[)\[[A-Z]{2,}[^\]\n]{0,60}\](?!\])")
 _LEFT = re.compile(r"\bleft\b|\blt\b|\bl/?s\b", re.I)
 _RIGHT = re.compile(r"\bright\b|\brt\b|\br/?s\b", re.I)
 
@@ -364,11 +368,11 @@ def check_leftovers(blocks, report: Report) -> None:
                 "Template text nobody replaced.", b.section or b.kind,
             ))
 
-        bracket = _BRACKET_PLACEHOLDER.search(text)
+        bracket = _BRACKET_PLACEHOLDER.search(text) or _CAPS_PLACEHOLDER.search(text)
         if bracket:
             report.findings.append(Finding(
                 "critical", f"Unfilled template bracket: “{bracket.group(0).strip()}”",
-                "A bracket from the template was never filled in.",
+                "A placeholder was never replaced with the patient's own value.",
                 b.section or b.kind,
             ))
 
