@@ -148,21 +148,51 @@ tool becomes somebody's data breach.
 
 ## Hosting it on Render
 
-`render.yaml` is in the repo. Render reads it, builds the app, creates the database and
-wires them together, so no connection string is ever copied by hand.
+`render.yaml` and `Dockerfile` are in the repo. Render reads the blueprint, builds the
+Docker image (which carries ffmpeg for dictation and tesseract-ocr for the free OCR
+tier — Render's native Python runtime cannot install either), and deploys.
 
-1. **[render.com](https://render.com)** → sign in with GitHub → **New** → **Blueprint**.
-2. Pick `Rdiology-Report-Maker`. Render finds `render.yaml` and shows what it will create:
-   one web service and one Postgres database, both free, Singapore region (closest to India).
-3. It asks for the two secrets that are deliberately not in the file:
+1. **Push the repo first.** Render deploys from GitHub — anything not committed and
+   pushed to `main` does not exist as far as Render is concerned.
+2. **[render.com](https://render.com)** → sign in with GitHub → **New** → **Blueprint**.
+3. Pick `Rdiology-Report-Maker`. Render finds `render.yaml`: one Docker web service,
+   free plan, Singapore region (closest to India).
+4. It asks for the three secrets that are deliberately not in the file:
+   - `STORAGE_URL` — your Neon connection string (set Neon up first, below)
    - `GEMINI_API_KEY` — your key
    - `ACCESS_CODE` — **required.** This is a public URL holding patient reports.
-4. Apply. First build takes a few minutes.
-5. Move your existing templates across, from this PC:
-   ```
-   python migrate_storage.py --to "<the External Database URL from Render>" --dry-run
-   ```
-   Check the list, then run it again without `--dry-run`.
+
+   The optional integrations (`ALERT_SMTP_*`, `TWILIO_*`, `ORTHANC_*`, `HF_TOKEN`) are
+   ordinary environment variables — add them under the service's **Environment** tab
+   whenever you start using those features.
+5. Apply. The first Docker build takes several minutes; later ones are cached.
+6. Open the service URL → Templates → Activity log. It must say
+   `Storage: Postgres at ep-...`. *JSON files* means the database is not connected and
+   anything saved dies on the next deploy.
+
+### Moving off Streamlit Cloud
+
+The same app, the same Neon database — so the move is repointing, not migrating:
+
+1. Deploy on Render as above, using the **same `STORAGE_URL`** the Streamlit Cloud app
+   uses. Every template, learned rule and report record appears immediately — the data
+   never lived on Streamlit Cloud in the first place.
+2. Set the same `GEMINI_API_KEY` and `ACCESS_CODE` (or new ones — rotating here is a
+   good moment).
+3. Verify on the Render URL: Templates load, the Activity log says Postgres, a test
+   report generates and audits PASS.
+4. Give the clinic the new URL, then delete the app on
+   [share.streamlit.io](https://share.streamlit.io) so the old public URL stops
+   serving. Two live URLs to the same patient-report app is two attack surfaces.
+5. If sign-in (`[auth]`) was configured: update the OIDC provider's redirect URI to
+   `https://<your-service>.onrender.com/oauth2callback`, and put the `[auth]` block in
+   a Render **Secret File** at `.streamlit/secrets.toml` (env vars cannot express it).
+
+What you gain over Streamlit Cloud: Docker (so local OCR and dictation audio work),
+optional custom domain, and the REST engine can be enabled as a second service.
+What stays the same: the free tier sleeps after idle (first visit waits ~a minute),
+and the DICOM C-STORE receiver still cannot run — Render accepts HTTPS only, no raw
+TCP. The Orthanc path works fine from Render.
 
 ### Where the database lives — and why not Render's
 

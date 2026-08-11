@@ -1,0 +1,22 @@
+# Local data and secrets must never end up inside an image.
+.streamlit/secrets.toml
+*.env
+.env
+templates/
+incoming_dicom/
+backups/
+data/
+output/
+*.db
+*.db-wal
+*.db-shm
+
+# Development noise
+.git/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.model_cache.json
+.devcontainer/
+.claude/

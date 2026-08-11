@@ -1,15 +1,16 @@
-# Render deployment.
+# Render deployment - Docker runtime.
+#
+# Docker, not Render's native Python runtime, because the app needs system
+# packages a native runtime cannot install: ffmpeg (dictation audio) and
+# tesseract-ocr (the free local OCR tier). The Dockerfile carries both.
 #
 # Render runs the app. The DATABASE LIVES ELSEWHERE, on purpose.
 #
 # Render's free Postgres has historically been deleted after 30 days, which for
 # this app means every doctor template and everything it has learned disappears.
 # Rather than build on that, the app points at a provider whose free tier is
-# permanent. Neon is the usual choice: no expiry, and 0.5 GB is enormous for what
-# this stores (text templates, not images).
-#
-# Nothing about the app changes - storage.py takes any postgres:// URL, so this
-# is purely which URL you paste.
+# permanent. Neon is the usual choice: no expiry, and 0.5 GB is enormous for
+# what this stores (text templates, not images).
 #
 # THREE secrets are set once in the Render dashboard and never reach this repo:
 #
@@ -17,29 +18,35 @@
 #     GEMINI_API_KEY   your key from aistudio.google.com
 #     ACCESS_CODE      required: this is a public URL holding patient reports
 #
-# See DEPLOY.md for the walkthrough and for the backup you should run regardless.
+# Optional integrations are also plain environment variables - add whichever
+# you use, in the dashboard, never here:
+#
+#     ALERT_SMTP_HOST / ALERT_SMTP_PORT / ALERT_SMTP_USER /
+#     ALERT_SMTP_PASSWORD / ALERT_FROM      critical result alerts by email
+#     TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM
+#                                           alerts by SMS and WhatsApp
+#     ORTHANC_URL / ORTHANC_USERNAME / ORTHANC_PASSWORD
+#                                           browse the clinic's Orthanc PACS
+#     HF_TOKEN                              hosted AI4Bharat speech
+#     AI_PROVIDER                           model vendor (default: gemini)
+#
+# What does NOT work on Render: the DICOM C-STORE receiver. Render web
+# services accept HTTPS only - no raw inbound TCP - so modalities cannot push
+# here. That feature is for the clinic-LAN install; the Orthanc client path
+# (outbound HTTPS) works from Render fine.
+#
+# See DEPLOY.md for the walkthrough and for the backup you should run anyway.
 
 services:
   - type: web
     name: radiology-report-maker
-    runtime: python
+    runtime: docker
     plan: free
     region: singapore          # closest Render region to India
     branch: main
-    buildCommand: pip install -r requirements.txt
-    # $PORT is assigned by Render; 0.0.0.0 so it accepts the proxied traffic.
-    startCommand: >
-      streamlit run app.py
-      --server.port $PORT
-      --server.address 0.0.0.0
-      --server.headless true
-      --server.enableCORS false
-      --server.enableXsrfProtection true
-      --browser.gatherUsageStats false
+    dockerfilePath: ./Dockerfile
     healthCheckPath: /_stcore/health
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.11"
       # sync: false means "ask me in the dashboard, never store it in git".
       - key: STORAGE_URL
         sync: false
@@ -49,10 +56,29 @@ services:
         sync: false
 
 # ---------------------------------------------------------------------------
+# The REST engine (api.py) as a second service - for a RIS or an integration
+# engine, not for browsers.
+#
+# COMMENTED OUT DELIBERATELY: api.py has no authentication of its own yet.
+# Publishing it on a public URL would let anyone on the internet run report
+# processing against your service. Enable it only behind Render's own access
+# controls, an API gateway, or after adding auth - and understand that report
+# text sent to it transits Render's infrastructure.
+#
+#  - type: web
+#    name: radiology-report-api
+#    runtime: docker
+#    plan: free
+#    region: singapore
+#    branch: main
+#    dockerfilePath: ./Dockerfile
+#    dockerCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+#    healthCheckPath: /health
+
+# ---------------------------------------------------------------------------
 # If you would rather use Render's own database anyway - because you have
 # upgraded it past the free tier, or you accept the expiry and will run the
-# monthly backup - delete the STORAGE_URL entry above, uncomment both blocks
-# below, and Render will wire the connection string in for you.
+# monthly backup - replace the STORAGE_URL entry above with:
 #
 #      - key: STORAGE_URL
 #        fromDatabase:
