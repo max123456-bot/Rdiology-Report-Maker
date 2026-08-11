@@ -2898,7 +2898,8 @@ with tab_draft:
         with reset_draft:
             if st.button("Start over", width="stretch"):
                 for key in ("draft_out", "draft_in", "draft_questions", "draft_assumptions",
-                            "draft_answers", "draft_original", "draft_section"):
+                            "draft_answers", "draft_original", "draft_section",
+                            "draft_prompt", "draft_edit"):
                     st.session_state.pop(key, None)
                 st.rerun()
 
@@ -2958,9 +2959,15 @@ with tab_draft:
                      "and *shorthand expansion* restyles nothing.",
             )
             instruction_mode = section.startswith("a full report")
+            # Keyed, not value=-seeded: an unkeyed text_area derives its
+            # identity from the value parameter, so every generation rebuilt
+            # the widget and could silently revert the doctor's edits.
+            if "draft_prompt" not in st.session_state and \
+                    st.session_state.get("draft_in"):
+                st.session_state["draft_prompt"] = st.session_state["draft_in"]
             rough = st.text_area(
                 "Doctor's prompt",
-                value=st.session_state.get("draft_in", ""),
+                key="draft_prompt",
                 height=220,
                 label_visibility="collapsed",
                 placeholder=(
@@ -3058,7 +3065,16 @@ with tab_draft:
                 )
             else:
                 generated_for = st.session_state.get("draft_section", "")
-                if generated_for and generated_for != section:
+                generated_from = st.session_state.get("draft_in", "")
+                if generated_from and rough.strip() != generated_from.strip():
+                    st.warning(
+                        "**Your prompt has changed since this draft was generated** — "
+                        "the draft below (and the badges) still reflect the OLD "
+                        "prompt. Press *Write in this doctor's style* again to "
+                        "regenerate.",
+                        icon=":material/sync_problem:",
+                    )
+                elif generated_for and generated_for != section:
                     st.warning(
                         f"This draft was generated for **{generated_for.split(' - ')[0]}** — "
                         f"you have now selected **{section.split(' - ')[0]}**. Press "
