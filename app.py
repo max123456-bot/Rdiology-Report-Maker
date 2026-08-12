@@ -459,40 +459,9 @@ else:
         f"{len(template.vocabulary)} dictation term(s)"
     )
 
-with st.sidebar.expander(":material/group: Manage profiles"):
-    _profiles = [n for n in template_names if not all_templates[n].builtin]
-    if not _profiles:
-        st.caption("No doctor profiles yet — create one in the Draft tab, "
-                   "or with *New* below.")
-    else:
-        # One store pass for every profile's counts, not one per profile.
-        try:
-            _all_memories = memory.load()
-            _all_pairs = memory.load_pairs()
-            _all_chats = memory.load_chats(limit=memory.MAX_CHATS)
-        except Exception:
-            _all_memories, _all_pairs, _all_chats = [], [], []
-        for name in _profiles:
-            t = all_templates[name]
-            rules = sum(1 for m in _all_memories
-                        if m.doctor == name and m.kind == "style_rule")
-            cases = sum(1 for m in _all_memories
-                        if m.doctor == name and m.kind == "episodic_case")
-            chats = sum(1 for c in _all_chats if c.get("doctor") == name)
-            with st.container(border=True):
-                st.markdown(f"**{name}**"
-                            + (f" · {t.doctor}" if t.doctor else ""))
-                st.caption(f"{len(t.preferences)} rule(s) · {rules} remembered "
-                           f"· {cases} case(s) · {chats} chat(s)")
-                if name != picked_template:
-                    if st.button(":material/login: Switch to this profile",
-                                 key=f"prof_switch_{name}", width="stretch"):
-                        st.session_state["tpl_pick_pending"] = name
-                        st.rerun()
-                else:
-                    st.caption(":material/check: active now")
-    st.caption("Profiles hold the doctor's voice and history. Page formatting "
-               "lives under **Format templates** below.")
+# The manager renders here (between the switcher and the format section) but
+# its body is drawn further down, once the edit/delete dialogs exist.
+profiles_slot = st.sidebar.container()
 
 st.sidebar.caption(f"**Format:** {template_summary(template)}")
 
@@ -586,6 +555,11 @@ def _dialog_edit(current: templates.Template):
                                    key="ed_lh_contact")
 
     if st.button("Save changes", type="primary", width="stretch"):
+        if name.strip() and name.strip() != current.name \
+                and name.strip() in all_templates:
+            st.error(f"“{name.strip()}” already exists — a rename cannot "
+                     "overwrite another profile.")
+            return
         updated = templates.copy_of(current, name.strip() or current.name, doctor.strip())
         updated.font_name, updated.font_size, updated.font_color = font, float(size), colour
         updated.line_spacing = float(spacing)
@@ -675,6 +649,115 @@ def _dialog_delete(current: templates.Template):
     with no:
         if st.button("Cancel", width="stretch"):
             st.rerun()
+
+
+@st.dialog("Rename doctor profile")
+def _dialog_rename_profile(current: templates.Template):
+    st.write(f"Rename **{current.name}**"
+             + (f" ({current.doctor})" if current.doctor else "") + ".")
+    st.caption("Everything the profile has learned — the remembered rules, past "
+               "cases and chat history — moves to the new name. Nothing is lost.")
+    new_name = st.text_input("New profile name", value=current.name,
+                             key="prof_rename_name")
+    new_doctor = st.text_input("Doctor's display name", value=current.doctor,
+                               key="prof_rename_doctor",
+                               placeholder="Dr. Sharad Kulkarni")
+    go, stop = st.columns(2)
+    with go:
+        if st.button("Rename", type="primary", width="stretch"):
+            clean = new_name.strip()
+            if not clean:
+                st.error("Give the profile a name.")
+            elif clean != current.name and clean in all_templates:
+                st.error(f"“{clean}” already exists — pick another name.")
+            else:
+                updated = templates.copy_of(current, clean, new_doctor.strip())
+                try:
+                    templates.rename(current.name, updated)
+                    templates_changed()
+                except templates.ConflictError as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state["tpl_pick_pending"] = clean
+                    st.rerun()
+    with stop:
+        if st.button("Cancel", width="stretch", key="prof_rename_cancel"):
+            st.rerun()
+
+
+@st.dialog("Delete doctor profile")
+def _dialog_delete_profile(current: templates.Template):
+    stats = {}
+    try:
+        stats = memory.profile_stats(current.name)
+    except Exception:
+        pass
+    st.write(f"Delete **{current.name}**"
+             + (f" ({current.doctor})" if current.doctor else "")
+             + " and everything it has learned?")
+    bits = [f"{len(current.preferences)} learned rule(s)",
+            f"{len(current.examples)} voice sample(s)"]
+    if stats:
+        bits.append(f"{stats.get('rules', 0)} remembered rule(s)")
+        bits.append(f"{stats.get('cases', 0)} past case(s)")
+        bits.append(f"{stats.get('chats', 0)} chat(s)")
+    st.caption("Goes permanently: " + ", ".join(bits) + ".")
+    st.warning("This cannot be undone.", icon=":material/warning:")
+    go, stop = st.columns(2)
+    with go:
+        if st.button("Delete profile", type="primary", width="stretch",
+                     key="prof_del_confirm"):
+            templates.delete(current.name)   # also forgets its memory + chats
+            templates_changed()
+            st.session_state["tpl_pick_pending"] = templates.HC_FORMAT.name
+            st.rerun()
+    with stop:
+        if st.button("Cancel", width="stretch", key="prof_del_cancel"):
+            st.rerun()
+
+
+# ---- profile manager: WHO writes (identity, learning, history) ---- #
+with profiles_slot.expander(":material/group: Manage doctor profiles"):
+    _profiles = [n for n in template_names if not all_templates[n].builtin]
+    if not _profiles:
+        st.caption("No doctor profiles yet — create one in the Draft tab, or "
+                   "with **New** below.")
+    else:
+        try:
+            _all_memories = memory.load()
+            _all_chats = memory.load_chats(limit=memory.MAX_CHATS)
+        except Exception:
+            _all_memories, _all_chats = [], []
+        for name in _profiles:
+            t = all_templates[name]
+            rules = sum(1 for m in _all_memories
+                        if m.doctor == name and m.kind == "style_rule")
+            cases = sum(1 for m in _all_memories
+                        if m.doctor == name and m.kind == "episodic_case")
+            chats = sum(1 for c in _all_chats if c.get("doctor") == name)
+            with st.container(border=True):
+                st.markdown(f"**{name}**" + (f" · {t.doctor}" if t.doctor else "")
+                            + (" · active" if name == picked_template else ""))
+                st.caption(f"{len(t.preferences)} rule(s) · {rules} remembered "
+                           f"· {cases} case(s) · {chats} chat(s)")
+                pm1, pm2, pm3 = st.columns(3)
+                with pm1:
+                    if st.button(":material/login: Use",
+                                 key=f"prof_use_{name}", width="stretch",
+                                 disabled=name == picked_template):
+                        st.session_state["tpl_pick_pending"] = name
+                        st.rerun()
+                with pm2:
+                    if st.button(":material/edit: Rename",
+                                 key=f"prof_ren_{name}", width="stretch"):
+                        _dialog_rename_profile(t)
+                with pm3:
+                    if st.button(":material/delete: Delete",
+                                 key=f"prof_del_{name}", width="stretch"):
+                        _dialog_delete_profile(t)
+    st.caption("A profile is WHO writes — the doctor's voice, memory and chat "
+               "history. HOW the page looks — fonts, margins, letterhead — is "
+               "**Format templates** below.")
 
 
 with new_col:
@@ -4607,14 +4690,26 @@ with tab_templates:
                      disabled=editing.builtin,
                      help="The built-in HC FORMAT cannot be overwritten."
                           if editing.builtin else "Write these changes to disk."):
-            try:
-                templates.save(pending, expect=st.session_state.get(f"fp::{editing.name}"))
-                templates_changed()
-            except templates.ConflictError as exc:
-                st.error(str(exc))
+            renaming = pending.name.strip() != editing.name.strip()
+            if renaming and pending.name.strip() in all_templates:
+                st.error(f"“{pending.name.strip()}” already exists — a rename "
+                         "cannot overwrite another template.")
             else:
-                st.success(f"Saved “{t_name}”.")
-                st.rerun()
+                try:
+                    if renaming:
+                        # A changed name is a RENAME: the old record goes, and
+                        # the doctor's memory/chats follow the new name. Plain
+                        # save here used to leave a duplicate under the old name.
+                        templates.rename(editing.name, pending)
+                        st.session_state["tpl_pick_pending"] = pending.name
+                    else:
+                        templates.save(pending, expect=st.session_state.get(f"fp::{editing.name}"))
+                    templates_changed()
+                except templates.ConflictError as exc:
+                    st.error(str(exc))
+                else:
+                    st.success(f"Saved “{t_name}”.")
+                    st.rerun()
     with act2:
         if st.button(":material/content_copy: Save as new", width="stretch",
                      type="primary" if (dirty and editing.builtin) else "secondary",

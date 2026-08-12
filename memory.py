@@ -460,6 +460,96 @@ def load_chats(tenant: str | None = None, doctor: str | None = None,
     return out[-limit:]
 
 
+def _rewrite_payload(name: str, list_key: str, rewrite,
+                     tenant: str | None = None) -> int:
+    """
+    Apply `rewrite(entry)` to one reserved payload's list.
+
+    rewrite returns None to keep an entry it MUTATED in place, True to keep
+    it untouched, or False to drop it. Returns how many entries were changed
+    (mutated or dropped), and persists only when something actually changed.
+    """
+    scope = tenant or storage.current_tenant()
+    store = storage.get_store()
+    try:
+        payload = store.load_all(scope).get(name) or {}
+    except Exception:
+        return 0
+    entries = payload.get(list_key) if isinstance(payload, dict) else []
+    if not isinstance(entries, list):
+        return 0
+    kept, changed = [], 0
+    for entry in entries:
+        if isinstance(entry, dict):
+            keep = rewrite(entry)
+            if keep is None:      # mutated in place, keep it
+                changed += 1
+                kept.append(entry)
+            elif keep is False:   # dropped
+                changed += 1
+            else:                 # unchanged, keep it
+                kept.append(entry)
+        else:
+            kept.append(entry)
+    if changed:
+        payload = dict(payload) if isinstance(payload, dict) else {}
+        payload.update({"name": name, "updated": _now(), list_key: kept})
+        store.save(scope, name, payload)
+    return changed
+
+
+def rename_doctor(old: str, new: str, tenant: str | None = None) -> int:
+    """
+    A doctor's rename carries their WHOLE history: memories, preference
+    pairs and chats all move to the new name. Returns how many records moved.
+    """
+    if not old.strip() or not new.strip() or old == new:
+        return 0
+    moved = 0
+    memories = load(tenant)
+    for m in memories:
+        if m.doctor == old:
+            m.doctor = new
+            moved += 1
+    if moved:
+        save(memories, tenant)
+
+    def _move(entry: dict):
+        if entry.get("doctor") == old:
+            entry["doctor"] = new
+            return None   # touched, keep
+        return True
+
+    moved += _rewrite_payload(PAIRS_NAME, "pairs", _move, tenant)
+    moved += _rewrite_payload(CHATS_NAME, "chats", _move, tenant)
+    if moved:
+        storage.log("memory.renamed", new, f"was {old}: {moved} record(s) moved")
+    return moved
+
+
+def forget_doctor(doctor: str, tenant: str | None = None) -> int:
+    """
+    Deleting a profile deletes its learning: memories, pairs and chats all
+    go with it. Returns how many records were removed.
+    """
+    if not doctor.strip():
+        return 0
+    memories = load(tenant)
+    kept = [m for m in memories if m.doctor != doctor]
+    removed = len(memories) - len(kept)
+    if removed:
+        save(kept, tenant)
+
+    def _drop(entry: dict):
+        return entry.get("doctor") != doctor
+
+    removed += _rewrite_payload(PAIRS_NAME, "pairs", _drop, tenant)
+    removed += _rewrite_payload(CHATS_NAME, "chats", _drop, tenant)
+    if removed:
+        storage.log("memory.forgotten", doctor, f"{removed} record(s) removed")
+    return removed
+
+
 def profile_stats(doctor: str, tenant: str | None = None) -> dict:
     """One profile's learning at a glance - for the profile manager."""
     mine = [m for m in load(tenant) if m.doctor == doctor]

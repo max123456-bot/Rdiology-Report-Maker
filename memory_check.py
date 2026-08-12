@@ -177,6 +177,31 @@ with tempfile.TemporaryDirectory() as tmp:
         listed_again = templates.load_all(tenant="clinic_a")
         check(memory.CHATS_NAME not in listed_again,
               "the chat record never appears as a template")
+
+        # ------------------------------------------------------------------- #
+        print("\nrename and delete - the doctor's history follows, then goes")
+        # ------------------------------------------------------------------- #
+
+        before = memory.profile_stats("Dr. A", tenant="clinic_a")
+        check(before["rules"] > 0 and before["chats"] > 0,
+              "Dr. A starts with learning and chats on file")
+        moved = memory.rename_doctor("Dr. A", "Dr. Alpha", tenant="clinic_a")
+        check(moved > 0, f"rename moved {moved} record(s)")
+        gone = memory.profile_stats("Dr. A", tenant="clinic_a")
+        now = memory.profile_stats("Dr. Alpha", tenant="clinic_a")
+        check(gone["rules"] == 0 and gone["chats"] == 0 and gone["pairs"] == 0,
+              "nothing is left under the old name")
+        check(now["rules"] == before["rules"] and now["chats"] == before["chats"]
+              and now["pairs"] == before["pairs"],
+              "everything moved intact to the new name")
+
+        removed = memory.forget_doctor("Dr. Alpha", tenant="clinic_a")
+        check(removed > 0, f"delete removed {removed} record(s)")
+        after = memory.profile_stats("Dr. Alpha", tenant="clinic_a")
+        check(after["rules"] == 0 and after["chats"] == 0 and after["pairs"] == 0,
+              "a deleted profile leaves no memory, pairs or chats behind")
+        check(bool(memory.load_chats(tenant="clinic_a", doctor="Dr. B")),
+              "another doctor's history is untouched by the delete")
     finally:
         storage.get_store = real_get_store
 

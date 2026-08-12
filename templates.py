@@ -401,6 +401,14 @@ def delete(name: str, tenant: str | None = None) -> bool:
     removed = storage.get_store().delete(tenant or storage.current_tenant(), name)
     if removed:
         storage.log("template.deleted", name)
+        # A profile's memories, preference pairs and chat history go with it -
+        # an orphaned history under a dead name is a privacy leak, not a keepsake.
+        try:
+            import memory
+
+            memory.forget_doctor(name, tenant)
+        except Exception:
+            pass  # the template deletion itself must never fail on this
     return removed
 
 
@@ -410,6 +418,14 @@ def rename(old_name: str, template: Template, tenant: str | None = None) -> str:
     if old_name.strip() != template.name.strip():
         storage.get_store().delete(tenant or storage.current_tenant(), old_name)
         storage.log("template.renamed", template.name, f"was {old_name}")
+        # The doctor's learning follows the new name - memories, preference
+        # pairs and chats are keyed by profile name and must move with it.
+        try:
+            import memory
+
+            memory.rename_doctor(old_name, template.name, tenant)
+        except Exception:
+            pass  # a failed migration must not undo the rename itself
     return written
 
 
