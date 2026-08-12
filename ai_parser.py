@@ -81,6 +81,7 @@ def build_draft_prompt(
     section: str = "the whole report",
     answers: dict[str, str] | None = None,
     corpus_terms: list[str] | None = None,
+    memory_context: str = "",
 ) -> str:
     """
     Assemble the few-shot prompt. Pure text, no network - so it can be tested.
@@ -115,6 +116,9 @@ def build_draft_prompt(
             "them to invent a finding that is not in the notes:\n"
             + ", ".join(library)
         )
+
+    if memory_context.strip():
+        parts.append("\n" + memory_context.strip())
 
     corrections = [
         c for c in (getattr(template, "corrections", None) or [])
@@ -264,6 +268,7 @@ def draft_with_questions(
     answers: dict[str, str] | None = None,
     temperature: float = 0.2,
     corpus_terms: list[str] | None = None,
+    memory_context: str = "",
 ) -> dict:
     """Draft, and come back with clarifying questions where the notes are ambiguous."""
     import json as _json
@@ -273,7 +278,8 @@ def draft_with_questions(
     client = _client(api_key)
     response = _generate(client,
         model=model,
-        contents=[build_draft_prompt(template, raw_notes, section, answers, corpus_terms)],
+        contents=[build_draft_prompt(template, raw_notes, section, answers, corpus_terms,
+                                     memory_context)],
         config=types.GenerateContentConfig(
             system_instruction=DRAFT_PROMPT + "\n\n" + ASK_PROMPT,
             response_mime_type="application/json",

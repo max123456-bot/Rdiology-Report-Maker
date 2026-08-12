@@ -45,6 +45,12 @@ MAX_SOURCES = 200
 MAX_TERM_CHARS = 60
 MIN_TERM_CHARS = 4
 
+# Reference chunks: whole passages kept for retrieval WITH citation, so an
+# answer can say which book and which part it came from.
+CHUNK_CHARS = 1400
+MAX_CHUNKS_PER_SOURCE = 300
+MAX_CHUNKS_TOTAL = 2000
+
 # --------------------------------------------------------------------------- #
 # What a corpus is
 # --------------------------------------------------------------------------- #
@@ -61,6 +67,7 @@ class CorpusTerm:
 class Corpus:
     terms: dict[str, CorpusTerm] = field(default_factory=dict)  # keyed lowercase
     sources: dict[str, dict] = field(default_factory=dict)      # filename -> meta
+    chunks: list[dict] = field(default_factory=list)  # {source, seq, text, vector, embedder}
     updated: str = ""
 
 
@@ -325,6 +332,7 @@ def to_dict(corpus: Corpus) -> dict:
             for t in sorted(corpus.terms.values(),
                             key=lambda t: (-t.count, t.term.lower()))
         ],
+        "chunks": list(corpus.chunks[:MAX_CHUNKS_TOTAL]),
     }
 
 
@@ -371,6 +379,26 @@ def from_dict(payload: dict) -> Corpus:
                             continue
             corpus.terms[term.lower()] = CorpusTerm(term=term, count=count,
                                                     sources=clean_sources)
+
+    raw_chunks = payload.get("chunks")
+    if isinstance(raw_chunks, list):
+        for entry in raw_chunks[:MAX_CHUNKS_TOTAL]:
+            if not isinstance(entry, dict):
+                continue
+            text = str(entry.get("text", "")).strip()
+            source = str(entry.get("source", "")).strip()
+            if not text or not source:
+                continue
+            vector = entry.get("vector")
+            corpus.chunks.append({
+                "source": source,
+                "seq": max(1, int(entry.get("seq", 1) or 1)),
+                "text": text[:CHUNK_CHARS * 2],
+                "vector": [float(v) for v in vector
+                           if isinstance(v, (int, float))]
+                if isinstance(vector, list) else [],
+                "embedder": str(entry.get("embedder", "hash-256")),
+            })
     return corpus
 
 
@@ -407,8 +435,12 @@ def save(corpus: Corpus, tenant: str | None = None, *,
 
 
 def add_source(corpus: Corpus, source_name: str, terms: list[CorpusTerm], *,
-               added_by: str = "", sha1: str = "") -> Corpus:
-    """Add (or replace) one uploaded document's terms."""
+               added_by: str = "", sha1: str = "", full_text: str = "",
+               api_key: str = "") -> Corpus:
+    """
+    Add (or replace) one uploaded document's terms - and, when the full text
+    is offered, its reference chunks for cited retrieval.
+    """
     name = source_name.strip()
     if not name:
         return corpus
@@ -426,8 +458,19 @@ def add_source(corpus: Corpus, source_name: str, terms: list[CorpusTerm], *,
         else:
             existing.count += count
             existing.sources[name] = existing.sources.get(name, 0) + count
+    if full_text.strip():
+        import memory as memory_engine
+
+        for seq, piece in enumerate(chunk_text(full_text), start=1):
+            if len(corpus.chunks) >= MAX_CHUNKS_TOTAL:
+                break
+            vector, embedder = memory_engine.embed(piece, api_key)
+            corpus.chunks.append({"source": name, "seq": seq, "text": piece,
+                                  "vector": vector, "embedder": embedder})
     corpus.sources[name] = {"added_at": _now(), "added_by": added_by,
-                            "terms": len(terms), "sha1": sha1}
+                            "terms": len(terms), "sha1": sha1,
+                            "chunks": sum(1 for c in corpus.chunks
+                                          if c.get("source") == name)}
     return corpus
 
 
@@ -441,6 +484,7 @@ def remove_source(corpus: Corpus, source_name: str) -> Corpus:
         term.count = max(0, term.count - contributed)
         if not term.sources or term.count <= 0:
             del corpus.terms[lower]
+    corpus.chunks = [c for c in corpus.chunks if c.get("source") != name]
     return corpus
 
 
@@ -450,6 +494,10 @@ def merge(corpus: Corpus, other: Corpus) -> Corpus:
         if name in corpus.sources or len(corpus.sources) >= MAX_SOURCES:
             continue
         corpus.sources[name] = dict(meta)
+        for chunk in other.chunks:
+            if chunk.get("source") == name \
+                    and len(corpus.chunks) < MAX_CHUNKS_TOTAL:
+                corpus.chunks.append(dict(chunk))
         for lower, incoming in other.terms.items():
             contributed = incoming.sources.get(name, 0)
             if not contributed:
@@ -707,3 +755,64 @@ def stt_hint(context: str, hot_vocabulary: list[str], index: TermIndex,
             break
         out = joined
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Reference chunks - retrieval with a citation, never an uncited answer
+# --------------------------------------------------------------------------- #
+
+
+def chunk_text(text: str) -> list[str]:
+    """
+    Section-aware pieces of a document: paragraphs packed to ~CHUNK_CHARS,
+    with the previous paragraph carried over so a sentence split across a
+    boundary is still findable. Deterministic.
+    """
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text or "")
+                  if p.strip()]
+    chunks: list[str] = []
+    current = ""
+    previous = ""
+    for paragraph in paragraphs:
+        if current and len(current) + len(paragraph) + 2 > CHUNK_CHARS:
+            chunks.append(current)
+            # Overlap: the last paragraph rides into the next chunk.
+            current = f"{previous}\n\n{paragraph}" if previous else paragraph
+        else:
+            current = f"{current}\n\n{paragraph}" if current else paragraph
+        previous = paragraph
+        if len(chunks) >= MAX_CHUNKS_PER_SOURCE:
+            break
+    if current and len(chunks) < MAX_CHUNKS_PER_SOURCE:
+        chunks.append(current)
+    return chunks
+
+
+def search_chunks(query: str, k: int = 3, tenant: str | None = None,
+                  api_key: str = "") -> list[dict]:
+    """
+    The k most relevant passages across every uploaded document, each with
+    its citation: {"citation": "source · part N", "text": ..., "score": ...}.
+    """
+    import memory as memory_engine
+
+    library = load(tenant)
+    if not library.chunks or not query.strip():
+        return []
+    query_vec, query_embedder = memory_engine.embed(query, api_key)
+
+    scored = []
+    for chunk in library.chunks:
+        if chunk.get("embedder") == query_embedder and chunk.get("vector"):
+            score = memory_engine.cosine(query_vec, chunk["vector"])
+        else:
+            score = memory_engine._keyword_overlap(query, chunk.get("text", ""))
+        if score > 0.02:
+            scored.append((score, chunk))
+    scored.sort(key=lambda pair: (-pair[0], pair[1].get("source", ""),
+                                  pair[1].get("seq", 0)))
+    return [{
+        "citation": f"{c.get('source', '?')} · part {c.get('seq', '?')}",
+        "text": c.get("text", ""),
+        "score": round(s, 3),
+    } for s, c in scored[:k]]

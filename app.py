@@ -31,6 +31,7 @@ import dictation_fix
 import guidelines
 import impression as impression_engine
 import interop
+import memory
 import mllp
 import notify
 import pacs
@@ -1015,6 +1016,30 @@ def to_pdf(docx_bytes: bytes) -> bytes | None:
 
 st.title("HC Format Radiology Report Generator")
 st.caption("Every word preserved, and checked. Formatting per the selected doctor's template.")
+
+# ------------------------- Active doctor banner ----------------------------- #
+if template.builtin:
+    st.info(
+        ":material/draw: **You are on the default HC FORMAT** — it formats "
+        "perfectly but holds no doctor's voice and cannot learn. Open the "
+        "**Draft in doctor's style** tab and create the doctor's profile in "
+        "one click; every correction after that is remembered.",
+        icon=":material/school:",
+    )
+else:
+    try:
+        _mine = [m for m in memory.load() if m.doctor == template.name]
+    except Exception:
+        _mine = []
+    _mem_rules = sum(1 for m in _mine if m.kind == "style_rule")
+    _mem_cases = sum(1 for m in _mine if m.kind == "episodic_case")
+    st.caption(
+        f":material/badge: **Doctor profile: "
+        f"{template.doctor or picked_template}** · "
+        f"{len(template.preferences)} learned rule(s) active · "
+        f"{_mem_rules} remembered rule(s) · {_mem_cases} past case(s) "
+        "retrievable while drafting"
+    )
 
 (tab_single, tab_worklist, tab_dictate, tab_batch, tab_draft, tab_templates,
  tab_rules) = st.tabs(
@@ -3252,6 +3277,8 @@ with tab_draft:
                         notes, template, api_key, model_choice,
                         section=section, answers=answers,
                         corpus_terms=corpus.relevant_terms(notes, corpus.get_index()),
+                        memory_context=memory.context_block(
+                            template.name, notes, api_key=api_key),
                     )
                 except Exception as exc:
                     st.error(f"Drafting failed: {exc}")
@@ -3320,6 +3347,29 @@ with tab_draft:
 
             for assumption in st.session_state.get("draft_assumptions", []):
                 st.caption(f"Assumed: {assumption}")
+
+            # -------- ask the clinic library, with citations -------- #
+            if corpus.load().chunks:
+                with st.expander(":material/menu_book: Ask the clinic library"):
+                    st.caption(
+                        "Search the uploaded books and papers. Passages come "
+                        "back WITH their citation — nothing is ever inserted "
+                        "into the draft automatically."
+                    )
+                    lib_query = st.text_input(
+                        "What to look up", key="draft_lib_query",
+                        placeholder="fleischner follow-up for 7 mm nodule",
+                    )
+                    if lib_query.strip():
+                        found = corpus.search_chunks(lib_query, k=3,
+                                                     api_key=api_key or "")
+                        if not found:
+                            st.caption("Nothing relevant in the library.")
+                        for hit in found:
+                            with st.container(border=True):
+                                st.caption(f"**{hit['citation']}** · "
+                                           f"relevance {hit['score']:.0%}")
+                                st.markdown(hit["text"][:900])
 
         # -------- the draft, the safety badges, the teaching -------- #
 
@@ -3465,6 +3515,24 @@ with tab_draft:
                         )
                         templates.save(learned)
                         templates_changed()
+                        # The uncapped archive: rules with embeddings for
+                        # retrieval, and the (notes, draft, edit) triple for
+                        # the DPO dataset.
+                        for rule in rules:
+                            try:
+                                memory.remember(template.name, "style_rule",
+                                                rule[:60], rule, api_key=api_key)
+                            except Exception:
+                                pass
+                        try:
+                            memory.record_pair(
+                                template.name,
+                                st.session_state.get("draft_in", ""),
+                                original, drafted,
+                                rule=rules[0] if rules else note,
+                            )
+                        except Exception:
+                            pass
                         st.session_state["draft_original"] = drafted
                         if rules:
                             st.success("Learned:")
@@ -3503,6 +3571,23 @@ with tab_draft:
                         learned = templates.remember_correction(learned, original, drafted)
                     templates.save(learned)
                     templates_changed()
+                    # An accepted report becomes an episodic memory: the next
+                    # similar study retrieves how this doctor phrased this one.
+                    try:
+                        first_line = next(
+                            (line.strip() for line in
+                             st.session_state.get("draft_in", "").splitlines()
+                             if line.strip()), "report")
+                        memory.remember(template.name, "episodic_case",
+                                        first_line[:80], drafted[:2000],
+                                        api_key=api_key)
+                        if corrected:
+                            memory.record_pair(
+                                template.name,
+                                st.session_state.get("draft_in", ""),
+                                original, drafted)
+                    except Exception:
+                        pass
                     st.success(
                         f"Saved. {doctor_label} now knows "
                         f"{templates.learning_summary(learned)}."
@@ -3789,6 +3874,7 @@ with tab_templates:
                     known |= {v.lower() for v in (_tpl.vocabulary or [])}
                 st.session_state[state_key] = corpus.extract_terms(
                     text, source=lib_file.name, known=known)
+                st.session_state[state_key + "_text"] = text
             candidates = st.session_state[state_key]
             if not candidates:
                 st.caption(f"**{lib_file.name}**: nothing new — every term is "
@@ -3817,11 +3903,15 @@ with tab_templates:
                 fresh = corpus.load()
                 fresh = corpus.add_source(
                     fresh, lib_file.name, picked,
-                    added_by=storage.current_user(), sha1=digest)
+                    added_by=storage.current_user(), sha1=digest,
+                    full_text=st.session_state.get(state_key + "_text", ""),
+                    api_key=api_key or "")
                 corpus.save(fresh)
                 st.session_state.pop(state_key, None)
+                st.session_state.pop(state_key + "_text", None)
                 st.success(f"Added. The library now holds "
-                           f"{len(fresh.terms)} term(s).")
+                           f"{len(fresh.terms)} term(s) and "
+                           f"{len(fresh.chunks)} reference passage(s).")
                 st.rerun()
 
         if _library.sources:

@@ -118,14 +118,15 @@ def draft_with_questions(raw_notes: str, template, api_key: str, model: str,
                          *, section: str = "the whole report",
                          answers: dict | None = None,
                          temperature: float = 0.2,
-                         corpus_terms: list[str] | None = None) -> dict:
+                         corpus_terms: list[str] | None = None,
+                         memory_context: str = "") -> dict:
     """House-style drafting on the local model, negation-checked."""
     import ai_parser
     import negation
 
     raw = generate(
         ai_parser.build_draft_prompt(template, raw_notes, section, answers,
-                                     corpus_terms),
+                                     corpus_terms, memory_context),
         system=ai_parser.DRAFT_PROMPT + "\n\n" + ai_parser.ASK_PROMPT,
         model=model,
         json_mode=True,

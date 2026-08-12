@@ -153,6 +153,43 @@ check(all(not hasattr(s, "text") for s in suggestions),
       "suggestions carry no rewritten text - applying is the user's act")
 
 # --------------------------------------------------------------------------- #
+print("\nreference chunks - retrieval with a citation")
+# --------------------------------------------------------------------------- #
+
+BOOK = "\n\n".join(
+    [f"Chapter paragraph {i}: " + ("cholangiocarcinoma staging follows the "
+     "AJCC system and portal vein thrombosis alters resectability. " * 3)
+     for i in range(6)]
+    + ["Fleischner guidance: a solid nodule of 7 mm in a low-risk patient "
+       "needs CT follow-up at 6 to 12 months."]
+)
+pieces = corpus.chunk_text(BOOK)
+check(pieces == corpus.chunk_text(BOOK), "chunking is deterministic")
+check(all(len(p) <= corpus.CHUNK_CHARS * 2 for p in pieces),
+      "chunks respect the size budget")
+
+with tempfile.TemporaryDirectory() as tmp:
+    store = storage.FileStore(tmp)
+    real_get_store = storage.get_store
+    storage.get_store = lambda: store
+    try:
+        lib = corpus.add_source(corpus.Corpus(), "book.txt",
+                                corpus.extract_terms(BOOK, source="book.txt"),
+                                full_text=BOOK)
+        corpus.save(lib, tenant="default")
+        check(len(lib.chunks) > 0, "full text becomes stored chunks")
+        hits = corpus.search_chunks("follow-up for a 7 mm solid nodule",
+                                    tenant="default")
+        check(bool(hits) and "book.txt" in hits[0]["citation"],
+              "retrieval answers with a citation to the source")
+        check(bool(hits) and "Fleischner" in hits[0]["text"],
+              "the most relevant passage wins")
+        cleared = corpus.remove_source(corpus.load(tenant="default"), "book.txt")
+        check(len(cleared.chunks) == 0, "removing a source removes its chunks")
+    finally:
+        storage.get_store = real_get_store
+
+# --------------------------------------------------------------------------- #
 print("\ntop-K selection - the whole corpus never enters a prompt")
 # --------------------------------------------------------------------------- #
 
