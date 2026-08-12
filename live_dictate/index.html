@@ -33,11 +33,15 @@
   #status { font-size: 13px; color: #5a6b83; }
   #timer { font-size: 13px; color: #5a6b83; font-variant-numeric: tabular-nums; }
 
-  /* Level meter - proves the mic is actually hearing something. */
+  /* Level meter - proves the mic is actually hearing something. Its fill is
+     the CLEANED signal, so the doctor sees the noise gate working. */
   #meter { flex: 1 1 120px; height: 6px; background: #e7ebf1; border-radius: 3px;
-           overflow: hidden; min-width: 80px; }
+           overflow: hidden; min-width: 80px; position: relative; }
   #level { height: 100%; width: 0%; background: #3ea15b; transition: width .08s linear; }
   #meter.hot #level { background: #e8b53a; }
+  #gateMark { position: absolute; top: -2px; bottom: -2px; width: 2px;
+              background: #b04632; opacity: .55; }
+  #meter.gated #level { background: #c9d0da; }
 
   #box {
     min-height: 190px; max-height: 460px; overflow-y: auto;
@@ -54,6 +58,8 @@
   .hint { font-size: 12.5px; color: #7a8699; }
   .warn { font-size: 13px; color: #8a5a00; background: #fff6e5;
           border: 1px solid #f0dcae; border-radius: 8px; padding: 9px 12px; }
+  #nr { font-size: 12.5px; color: #5a6b83; }
+  #nr b { color: #2c7a4b; }
 </style>
 </head>
 <body>
@@ -63,7 +69,7 @@
       <button id="stop" class="stop" type="button" disabled>■ Stop &amp; transcribe</button>
       <span id="dot"></span>
       <span id="timer">00:00</span>
-      <div id="meter"><div id="level"></div></div>
+      <div id="meter"><div id="level"></div><span id="gateMark"></span></div>
       <span id="status">Ready</span>
     </div>
 
@@ -73,6 +79,7 @@
     <div class="hint" id="hint">
       Speak normally. You can type or correct in the box while you talk.
     </div>
+    <div id="nr"></div>
   </div>
 
 <script>
@@ -106,6 +113,7 @@
   var level    = document.getElementById("level");
   var meter    = document.getElementById("meter");
   var hint     = document.getElementById("hint");
+  var nrEl     = document.getElementById("nr");
 
   var finalText = "";
   var interimText = "";
@@ -113,10 +121,42 @@
   var recognitionWanted = false;
   var recorder = null;
   var chunks = [];
-  var stream = null;
-  var audioCtx = null, analyser = null, rafId = null;
+  var stream = null;             // the raw microphone stream
+  var recordStream = null;       // what the recorder captures (cleaned, when on)
+  var audioCtx = null, analyser = null, rafId = null, gateNode = null;
   var startedAt = 0, tickId = null;
   var MAX_MB = 12;
+
+  // Noise-reduction settings, overridable from Streamlit via component args.
+  var cfg = {
+    denoise: true,       // the Web-Audio cleaning graph
+    strength: 0.5,       // 0..1 - drives the noise-gate threshold
+    lang: "en-IN"
+  };
+
+  // Streamlit hands args on every render. Read them so the Python side can
+  // turn the cleaning on/off and set its strength.
+  window.addEventListener("message", function (e) {
+    var d = e.data;
+    if (!d || d.type !== "streamlit:render" || !d.args) return;
+    var a = d.args;
+    if (typeof a.denoise === "boolean") cfg.denoise = a.denoise;
+    if (typeof a.strength === "number") cfg.strength = Math.max(0, Math.min(1, a.strength));
+    if (typeof a.lang === "string" && a.lang) cfg.lang = a.lang;
+    describeNR();
+  });
+
+  function describeNR() {
+    if (cfg.denoise) {
+      var pct = Math.round(cfg.strength * 100);
+      nrEl.innerHTML = "Noise cancellation <b>on</b> — rumble and hiss filtered, " +
+        "background between phrases gated (sensitivity " + pct + "%). " +
+        "The bar shows the cleaned signal.";
+    } else {
+      nrEl.textContent = "Noise cancellation off — recording the raw microphone.";
+    }
+    syncHeight();
+  }
 
   function setStatus(text) { statusEl.textContent = text; syncHeight(); }
 
@@ -124,8 +164,6 @@
     var safe = function (s) {
       return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     };
-    // Only repaint while listening; once stopped the box is the doctor's to edit
-    // freely and must not be overwritten under the caret.
     box.innerHTML = safe(finalText) + (interimText ? '<span id="interim">' + safe(interimText) + "</span>" : "");
     box.classList.toggle("empty", !finalText && !interimText);
     box.scrollTop = box.scrollHeight;
@@ -147,7 +185,7 @@
     recognition = new SR();
     recognition.continuous = true;
     recognition.interimResults = true;
-    recognition.lang = document.documentElement.lang || "en-IN";
+    recognition.lang = cfg.lang || document.documentElement.lang || "en-IN";
     recognition.maxAlternatives = 1;
 
     recognition.onresult = function (event) {
@@ -196,41 +234,112 @@
   }
 
   // ------------------------------------------------------------------ //
-  // Level meter - so a dead mic is obvious immediately, not after speaking
-  // a whole report into nothing.
+  // The cleaning graph. A real DSP chain feeding the recorder:
+  //   source -> high-pass(85Hz) -> low-pass(8.5kHz) -> compressor
+  //          -> noise gate -> destination
+  // The high-pass kills fan/AC/mains rumble, the low-pass trims tape hiss
+  // above the speech band, the compressor evens the level, and the gate
+  // silences the gaps between phrases so the recogniser never chews on room
+  // tone. Analyser taps the compressor output to drive both the gate and the
+  // level meter, so the meter shows exactly what the recorder will hear.
+  // Returns the stream to record. Falls back to the raw stream on any error.
   // ------------------------------------------------------------------ //
-  function startMeter(mediaStream) {
+  function buildGraph(mediaStream) {
+    if (!cfg.denoise) return mediaStream;
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      var source = audioCtx.createMediaStreamSource(mediaStream);
+
+      var hp = audioCtx.createBiquadFilter();
+      hp.type = "highpass"; hp.frequency.value = 85; hp.Q.value = 0.7;
+
+      var lp = audioCtx.createBiquadFilter();
+      lp.type = "lowpass"; lp.frequency.value = 8500; lp.Q.value = 0.7;
+
+      var comp = audioCtx.createDynamicsCompressor();
+      comp.threshold.value = -30; comp.knee.value = 24; comp.ratio.value = 3;
+      comp.attack.value = 0.003; comp.release.value = 0.25;
+
+      gateNode = audioCtx.createGain();
+      gateNode.gain.value = 1;
+
+      var dest = audioCtx.createMediaStreamDestination();
+
+      source.connect(hp); hp.connect(lp); lp.connect(comp);
+      comp.connect(gateNode); gateNode.connect(dest);
+
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      comp.connect(analyser);   // tap BEFORE the gate, so we can decide to open it
+
+      return dest.stream;
+    } catch (e) {
+      // Cleaning is a bonus, never a blocker.
+      audioCtx = null; analyser = null; gateNode = null;
+      return mediaStream;
+    }
+  }
+
+  // When no graph is built (denoise off / unsupported), still meter the raw mic.
+  function meterOnly(mediaStream) {
     try {
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       var source = audioCtx.createMediaStreamSource(mediaStream);
       analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 512;
+      analyser.fftSize = 1024;
       source.connect(analyser);
-      var data = new Uint8Array(analyser.frequencyBinCount);
-
-      var quietFor = 0;
-      (function loop() {
-        analyser.getByteTimeDomainData(data);
-        var peak = 0;
-        for (var i = 0; i < data.length; i++) {
-          peak = Math.max(peak, Math.abs(data[i] - 128));
-        }
-        var pct = Math.min(100, Math.round((peak / 128) * 260));
-        level.style.width = pct + "%";
-        meter.classList.toggle("hot", pct > 88);
-
-        quietFor = pct < 3 ? quietFor + 1 : 0;
-        if (quietFor === 150) setStatus("Hearing nothing — check the microphone.");
-        rafId = requestAnimationFrame(loop);
-      })();
     } catch (e) { /* meter is a nicety, never fatal */ }
   }
 
-  function stopMeter() {
+  function runMeterAndGate() {
+    if (!analyser) return;
+    var data = new Uint8Array(analyser.fftSize);
+    // Gate threshold: sensitivity 0 -> very permissive, 1 -> aggressive.
+    var gateThresh = 0.006 + cfg.strength * 0.05;
+    var openUntil = 0;
+    var quietFor = 0;
+
+    (function loop() {
+      analyser.getByteTimeDomainData(data);
+      var sum = 0, peak = 0;
+      for (var i = 0; i < data.length; i++) {
+        var v = (data[i] - 128) / 128;
+        sum += v * v;
+        peak = Math.max(peak, Math.abs(v));
+      }
+      var rms = Math.sqrt(sum / data.length);
+      var now = (audioCtx ? audioCtx.currentTime : 0);
+
+      // Noise gate with a short hold, so word-internal dips don't chop speech.
+      var gated = false;
+      if (gateNode && cfg.denoise) {
+        if (rms > gateThresh) openUntil = now + 0.35;   // 350 ms hold
+        var open = now < openUntil;
+        gated = !open;
+        var target = open ? 1 : 0;
+        // Smooth the gain so it fades rather than clicks.
+        gateNode.gain.setTargetAtTime(target, now, open ? 0.01 : 0.08);
+      }
+
+      var pct = Math.min(100, Math.round(peak * 260));
+      if (gated) pct = Math.min(pct, 6);
+      level.style.width = pct + "%";
+      meter.classList.toggle("hot", pct > 88);
+      meter.classList.toggle("gated", gated);
+
+      quietFor = pct < 3 ? quietFor + 1 : 0;
+      if (quietFor === 150) setStatus("Hearing nothing — check the microphone.");
+      rafId = requestAnimationFrame(loop);
+    })();
+  }
+
+  function stopAudio() {
     if (rafId) cancelAnimationFrame(rafId);
     rafId = null;
     level.style.width = "0%";
+    meter.classList.remove("gated", "hot");
     if (audioCtx) { try { audioCtx.close(); } catch (e) {} audioCtx = null; }
+    analyser = null; gateNode = null;
   }
 
   // ------------------------------------------------------------------ //
@@ -242,13 +351,24 @@
       return;
     }
     navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1,
+        sampleRate: 48000
+      }
     }).then(function (s) {
       stream = s;
       chunks = [];
-      finalText = box.innerText.replace(/ /g, " ").trim();  // keep anything already typed
+      finalText = box.innerText.replace(/ /g, " ").trim();  // keep anything already typed
       interimText = "";
       render();
+
+      // Build the cleaning graph (or just a meter) and record its output.
+      recordStream = buildGraph(stream);
+      if (!analyser) meterOnly(stream);   // denoise off/failed - meter raw
+      runMeterAndGate();
 
       var mime = "";
       ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"]
@@ -257,14 +377,14 @@
           return false;
         });
 
-      recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+      recorder = mime ? new MediaRecorder(recordStream, { mimeType: mime })
+                      : new MediaRecorder(recordStream);
       recorder.ondataavailable = function (e) { if (e.data && e.data.size) chunks.push(e.data); };
       recorder.onstop = finish;
       recorder.start();
 
       recognitionWanted = true;
       startRecognition();
-      startMeter(stream);
 
       startedAt = Date.now();
       tickId = setInterval(function () {
@@ -288,7 +408,6 @@
     stopBtn.disabled = true;
     setStatus("Finishing…");
     stopRecognition();
-    stopMeter();
     if (tickId) { clearInterval(tickId); tickId = null; }
     dot.classList.remove("live");
     if (recorder && recorder.state !== "inactive") recorder.stop();
@@ -296,10 +415,12 @@
   });
 
   function finish() {
+    // Stop the mic first, then tear the graph down.
     if (stream) {
       stream.getTracks().forEach(function (t) { t.stop(); });
       stream = null;
     }
+    stopAudio();
     var seconds = Math.round((Date.now() - startedAt) / 1000);
     var blob = new Blob(chunks, { type: (recorder && recorder.mimeType) || "audio/webm" });
 
@@ -314,11 +435,12 @@
     reader.onloadend = function () {
       var base64 = String(reader.result).split(",")[1] || "";
       setValue({
-        text: box.innerText.replace(/ /g, " ").trim(),
+        text: box.innerText.replace(/ /g, " ").trim(),
         audio: base64,
         mime: (blob.type || "audio/webm").split(";")[0],
         seconds: seconds,
         live_available: !!SR,
+        denoised: !!cfg.denoise,
         nonce: Date.now()
       });
       setStatus("Done — " + fmt(seconds) + " recorded. Transcribing…");
@@ -333,6 +455,7 @@
     syncHeight();
   });
 
+  describeNR();
   render();
   post("streamlit:componentReady", { apiVersion: 1 });
   syncHeight();

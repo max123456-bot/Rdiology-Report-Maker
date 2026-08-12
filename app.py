@@ -2988,10 +2988,36 @@ with tab_dictate:
             placeholder="MRI brain with contrast, post-op pituitary macroadenoma",
         )
 
+        nc_col, ns_col = st.columns([1, 2])
+        with nc_col:
+            denoise = st.checkbox(
+                "Noise cancellation", value=True, key="dict_denoise",
+                help="A real audio-cleaning chain in the browser: cuts fan/AC "
+                     "rumble and high hiss, evens the level, and gates the "
+                     "background between phrases. The recogniser gets a cleaner "
+                     "signal, so the accurate pass is more accurate. On top of "
+                     "the browser's own echo/noise suppression.",
+            )
+        with ns_col:
+            denoise_strength = st.slider(
+                "Gate sensitivity", 0.0, 1.0, 0.5, 0.05,
+                key="dict_denoise_strength", disabled=not denoise,
+                help="How eagerly the gap between phrases is silenced. Higher "
+                     "in a noisy room; lower if soft speech is being clipped.",
+            )
+
         st.caption("Speak normally — punctuation, headings and spoken corrections are handled.")
 
         # Live view while speaking, then an accurate pass over the same audio.
-        session = _live_dictate(key="dict_live", default=None)
+        # The component reads these args to drive its noise-cleaning graph.
+        _stt_lang = st.session_state.get("dict_stt_lang", "").strip()
+        session = _live_dictate(
+            key="dict_live", default=None,
+            denoise=bool(denoise),
+            strength=float(denoise_strength),
+            lang=(f"{_stt_lang}-IN" if _stt_lang and "-" not in _stt_lang
+                  else _stt_lang) or "en-IN",
+        )
 
         if session and session.get("nonce") != st.session_state.get("dict_nonce"):
             st.session_state["dict_nonce"] = session.get("nonce")
