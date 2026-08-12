@@ -157,6 +157,26 @@ with tempfile.TemporaryDirectory() as tmp:
         check(len(parsed) == 1 and parsed[0]["chosen"] == "the doctor's version"
               and parsed[0]["rejected"] == "the AI draft",
               "JSONL export is valid chosen/rejected training data")
+
+        # ------------------------------------------------------------------- #
+        print("\nchat history - every exchange, doctor-scoped")
+        # ------------------------------------------------------------------- #
+
+        memory.record_chat("Dr. A", "usg abdomen shorthand", "FINDINGS: ...",
+                           section="whole report", tenant="clinic_a")
+        memory.record_chat("Dr. B", "chest xray", "FINDINGS: ...",
+                           tenant="clinic_a")
+        memory.record_chat("Dr. A", "", "draft", tenant="clinic_a")   # no-op
+        mine = memory.load_chats(tenant="clinic_a", doctor="Dr. A")
+        check(len(mine) == 1 and mine[0]["prompt"] == "usg abdomen shorthand",
+              "chats are recorded and doctor-scoped")
+        check(len(memory.load_chats(tenant="clinic_a")) == 2,
+              "an empty prompt records nothing")
+        check(memory.load_chats(tenant="clinic_b") == [],
+              "tenant B sees no chats of tenant A")
+        listed_again = templates.load_all(tenant="clinic_a")
+        check(memory.CHATS_NAME not in listed_again,
+              "the chat record never appears as a template")
     finally:
         storage.get_store = real_get_store
 

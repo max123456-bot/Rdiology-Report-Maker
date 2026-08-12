@@ -41,10 +41,12 @@ import storage
 
 MEMORY_NAME = "__agent_memory__"
 PAIRS_NAME = "__preference_pairs__"
-RESERVED_NAMES = (MEMORY_NAME, PAIRS_NAME)
+CHATS_NAME = "__chat_history__"
+RESERVED_NAMES = (MEMORY_NAME, PAIRS_NAME, CHATS_NAME)
 
 MAX_MEMORIES = 2000
 MAX_PAIRS = 2000
+MAX_CHATS = 500
 MAX_CONTENT_CHARS = 4000
 
 # Recency decay: half-life of ~180 days. Old style preferences fade unless
@@ -403,3 +405,67 @@ def export_pairs_jsonl(tenant: str | None = None,
         "when": p.get("when", ""),
     }, ensure_ascii=False) for p in load_pairs(tenant, doctor)]
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Chat history - EVERY generation, not just the edited ones
+# --------------------------------------------------------------------------- #
+
+
+def record_chat(doctor: str, prompt: str, draft: str, section: str = "",
+                tenant: str | None = None) -> None:
+    """
+    One drafting exchange: the prompt as given, the draft as returned. The
+    preference-pairs archive only sees drafts the doctor corrected; this
+    sees them all, so the history reads like the session actually went.
+    """
+    if not prompt.strip() or not draft.strip():
+        return
+    scope = tenant or storage.current_tenant()
+    store = storage.get_store()
+    try:
+        payload = store.load_all(scope).get(CHATS_NAME) or {}
+    except Exception:
+        payload = {}
+    chats = payload.get("chats") if isinstance(payload, dict) else []
+    if not isinstance(chats, list):
+        chats = []
+    chats.append({
+        "doctor": doctor,
+        "prompt": prompt.strip()[:MAX_CONTENT_CHARS],
+        "draft": draft.strip()[:MAX_CONTENT_CHARS],
+        "section": section.strip()[:120],
+        "when": _now(),
+    })
+    store.save(scope, CHATS_NAME, {
+        "name": CHATS_NAME, "kind": "chat_history",
+        "updated": _now(), "chats": chats[-MAX_CHATS:],
+    })
+
+
+def load_chats(tenant: str | None = None, doctor: str | None = None,
+               limit: int = 50) -> list[dict]:
+    """Newest last. Filtered to one doctor when asked."""
+    scope = tenant or storage.current_tenant()
+    try:
+        payload = storage.get_store().load_all(scope).get(CHATS_NAME) or {}
+    except Exception:
+        return []
+    chats = payload.get("chats") if isinstance(payload, dict) else []
+    if not isinstance(chats, list):
+        return []
+    out = [c for c in chats if isinstance(c, dict)]
+    if doctor:
+        out = [c for c in out if c.get("doctor") == doctor]
+    return out[-limit:]
+
+
+def profile_stats(doctor: str, tenant: str | None = None) -> dict:
+    """One profile's learning at a glance - for the profile manager."""
+    mine = [m for m in load(tenant) if m.doctor == doctor]
+    return {
+        "rules": sum(1 for m in mine if m.kind == "style_rule"),
+        "cases": sum(1 for m in mine if m.kind == "episodic_case"),
+        "pairs": len(load_pairs(tenant, doctor)),
+        "chats": len(load_chats(tenant, doctor, limit=MAX_CHATS)),
+    }

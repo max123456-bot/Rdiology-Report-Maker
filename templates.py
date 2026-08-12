@@ -384,7 +384,7 @@ def save(template: Template, *, expect: str | None = None,
     write if someone else changed the same template in the meantime.
     """
     if template.name.strip() in ("__clinic_corpus__", "__agent_memory__",
-                                 "__preference_pairs__"):
+                                 "__preference_pairs__", "__chat_history__"):
         # corpus.py and memory.py store their records under these names in
         # the same store; a template wearing one would shadow them.
         raise ValueError("That name is reserved for the app's own records.")
@@ -421,7 +421,7 @@ def load_all(tenant: str | None = None) -> dict[str, Template]:
         if name == HC_FORMAT.name:
             continue
         if name in ("__clinic_corpus__", "__agent_memory__",
-                    "__preference_pairs__"):
+                    "__preference_pairs__", "__chat_history__"):
             # corpus.py and memory.py ride the same store under these
             # reserved names; none of them is a template. Exact match on
             # purpose.

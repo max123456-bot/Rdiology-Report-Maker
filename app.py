@@ -339,7 +339,7 @@ if use_ai:
             st.rerun()
 
 st.sidebar.divider()
-st.sidebar.subheader("Doctor / template")
+st.sidebar.subheader("Doctor profile")
 
 @st.cache_resource(show_spinner=False)
 def _template_cache() -> dict:
@@ -441,13 +441,60 @@ def _switch_profile() -> None:
 
 
 st.sidebar.selectbox(
-    "Active doctor / format", template_names, key="tpl_pick_side",
+    "Active doctor", template_names, key="tpl_pick_side",
     on_change=_switch_profile,
     format_func=lambda n: (
         n + (f" — {all_templates[n].doctor}" if all_templates[n].doctor else "")),
 )
 
-st.sidebar.caption(template_summary(template))
+# WHO is writing: the profile - identity and everything learned. HOW the
+# page looks - fonts, margins, letterhead - is the format section below.
+if template.builtin:
+    st.sidebar.caption("Built-in format — holds no doctor's voice. Create a "
+                       "profile in the Draft tab to start learning.")
+else:
+    st.sidebar.caption(
+        f"{len(template.preferences)} learned rule(s) · "
+        f"{len(template.examples)} voice sample(s) · "
+        f"{len(template.vocabulary)} dictation term(s)"
+    )
+
+with st.sidebar.expander(":material/group: Manage profiles"):
+    _profiles = [n for n in template_names if not all_templates[n].builtin]
+    if not _profiles:
+        st.caption("No doctor profiles yet — create one in the Draft tab, "
+                   "or with *New* below.")
+    else:
+        # One store pass for every profile's counts, not one per profile.
+        try:
+            _all_memories = memory.load()
+            _all_pairs = memory.load_pairs()
+            _all_chats = memory.load_chats(limit=memory.MAX_CHATS)
+        except Exception:
+            _all_memories, _all_pairs, _all_chats = [], [], []
+        for name in _profiles:
+            t = all_templates[name]
+            rules = sum(1 for m in _all_memories
+                        if m.doctor == name and m.kind == "style_rule")
+            cases = sum(1 for m in _all_memories
+                        if m.doctor == name and m.kind == "episodic_case")
+            chats = sum(1 for c in _all_chats if c.get("doctor") == name)
+            with st.container(border=True):
+                st.markdown(f"**{name}**"
+                            + (f" · {t.doctor}" if t.doctor else ""))
+                st.caption(f"{len(t.preferences)} rule(s) · {rules} remembered "
+                           f"· {cases} case(s) · {chats} chat(s)")
+                if name != picked_template:
+                    if st.button(":material/login: Switch to this profile",
+                                 key=f"prof_switch_{name}", width="stretch"):
+                        st.session_state["tpl_pick_pending"] = name
+                        st.rerun()
+                else:
+                    st.caption(":material/check: active now")
+    st.caption("Profiles hold the doctor's voice and history. Page formatting "
+               "lives under **Format templates** below.")
+
+st.sidebar.caption(f"**Format:** {template_summary(template)}")
 
 def category_picker(label: str, key: str, current: str = "General") -> str:
     """
@@ -3396,6 +3443,13 @@ with tab_draft:
                 except Exception as exc:
                     st.error(f"Drafting failed: {exc}")
                     return
+            # Every exchange lands in the chat history - not only the ones
+            # the doctor later corrects.
+            try:
+                memory.record_chat(template.name, notes, result["draft"],
+                                   section=section.split(" - ")[0])
+            except Exception:
+                pass
             st.session_state["draft_in"] = notes
             st.session_state["draft_section"] = section
             st.session_state["draft_out"] = result["draft"]
@@ -3788,39 +3842,69 @@ with tab_draft:
                 st.session_state["prefill"] = drafted
                 st.success("Loaded — open **Report** and choose the format.")
 
-        # ------------- history: past prompts, one click back ------------- #
+        # ------------- chat history: every exchange, one click back ------- #
 
         with st.expander(
-            f":material/history: Past drafts & prompts — {doctor_label}",
+            f":material/history: Chat history — {doctor_label}",
             expanded=False,
         ):
-            past = memory.load_pairs(doctor=template.name)
-            if not past:
-                st.caption(
-                    "Every time you press *Save edits & teach style* or save an "
-                    "edited draft to the doctor, the (notes, AI draft, your "
-                    "version) triple lands here — reusable, and exportable as a "
-                    "fine-tuning dataset."
-                )
-            for i, pair in enumerate(reversed(past[-10:])):
-                with st.container(border=True):
-                    head = pair.get("when", "")[:16].replace("T", " ")
-                    if pair.get("rule"):
-                        head += f" · learned: {pair['rule'][:80]}"
-                    st.caption(head or "undated")
-                    snippet = (pair.get("raw_prompt") or "").strip()
-                    st.text(snippet[:220] + ("…" if len(snippet) > 220 else ""))
-                    if st.button(":material/replay: Reuse this prompt",
-                                 key=f"hist_reuse_{i}"):
-                        st.session_state["draft_prompt_pending"] = snippet
-                        st.rerun()
-            if past:
-                st.download_button(
-                    ":material/download: Export all pairs as JSONL (DPO dataset)",
-                    data=memory.export_pairs_jsonl(doctor=template.name),
-                    file_name="preference_pairs.jsonl", mime="application/jsonl",
-                    key="hist_export",
-                )
+            chats_tab, edits_tab = st.tabs(
+                [":material/chat: All chats", ":material/school: Taught edits"])
+
+            with chats_tab:
+                chats = memory.load_chats(doctor=template.name, limit=20)
+                if not chats:
+                    st.caption(
+                        "Every draft generated for this doctor lands here — "
+                        "prompt and result, edited or not."
+                    )
+                for i, chat in enumerate(reversed(chats)):
+                    with st.container(border=True):
+                        head = chat.get("when", "")[:16].replace("T", " ")
+                        if chat.get("section"):
+                            head += f" · {chat['section']}"
+                        st.caption(head or "undated")
+                        snippet = (chat.get("prompt") or "").strip()
+                        st.text(snippet[:200]
+                                + ("…" if len(snippet) > 200 else ""))
+                        with st.popover(":material/visibility: View draft"):
+                            st.text(chat.get("draft", "")[:2000])
+                        if st.button(":material/replay: Reuse this prompt",
+                                     key=f"chat_reuse_{i}"):
+                            st.session_state["draft_prompt_pending"] = snippet
+                            st.rerun()
+
+            with edits_tab:
+                past = memory.load_pairs(doctor=template.name)
+                if not past:
+                    st.caption(
+                        "Every time you press *Save edits & teach style* or "
+                        "save an edited draft to the doctor, the (notes, AI "
+                        "draft, your version) triple lands here — the "
+                        "fine-tuning dataset."
+                    )
+                for i, pair in enumerate(reversed(past[-10:])):
+                    with st.container(border=True):
+                        head = pair.get("when", "")[:16].replace("T", " ")
+                        if pair.get("rule"):
+                            head += f" · learned: {pair['rule'][:80]}"
+                        st.caption(head or "undated")
+                        snippet = (pair.get("raw_prompt") or "").strip()
+                        st.text(snippet[:220]
+                                + ("…" if len(snippet) > 220 else ""))
+                        if st.button(":material/replay: Reuse this prompt",
+                                     key=f"hist_reuse_{i}"):
+                            st.session_state["draft_prompt_pending"] = snippet
+                            st.rerun()
+                if past:
+                    st.download_button(
+                        ":material/download: Export all pairs as JSONL "
+                        "(DPO dataset)",
+                        data=memory.export_pairs_jsonl(doctor=template.name),
+                        file_name="preference_pairs.jsonl",
+                        mime="application/jsonl",
+                        key="hist_export",
+                    )
 
         # ------------- keyboard-first: hotkeys + autofocus ------------- #
         # Injected into the PARENT document (Streamlit renders components in
@@ -3952,12 +4036,13 @@ with tab_templates:
                         st.rerun()
 
     with tpl_manager_slot.expander(
-        f":material/folder_managed: Template manager ({len(template_names)})",
+        f":material/folder_managed: Format templates ({len(template_names)})",
         expanded=False,
     ):
         st.caption(
-            "Every template in one place — filter by category, jump to edit, "
-            "duplicate, export as a file, import from one, or delete."
+            "How the PAGE looks — fonts, margins, letterhead, categories. "
+            "Filter, edit, duplicate, export, import, delete. The doctor's "
+            "voice and history live under **Manage profiles** above."
         )
         mgr_filter = st.selectbox(
             "Filter by category",
