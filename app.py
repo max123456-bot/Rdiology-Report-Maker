@@ -401,12 +401,24 @@ def template_summary(t: templates.Template) -> str:
     )
 
 
-st.sidebar.caption(
-    f"**{picked_template}**"
-    + (f" — {template.doctor}" if template.doctor else "")
-    + "\n\n"
-    + template_summary(template)
+# One-click profile switching from anywhere — drives the same pick the
+# Report tab's selectbox uses, and follows it when changed there.
+if st.session_state.get("tpl_pick_side") != picked_template:
+    st.session_state["tpl_pick_side"] = picked_template
+
+
+def _switch_profile() -> None:
+    st.session_state["tpl_pick"] = st.session_state["tpl_pick_side"]
+
+
+st.sidebar.selectbox(
+    "Active doctor / format", template_names, key="tpl_pick_side",
+    on_change=_switch_profile,
+    format_func=lambda n: (
+        n + (f" — {all_templates[n].doctor}" if all_templates[n].doctor else "")),
 )
+
+st.sidebar.caption(template_summary(template))
 
 def category_picker(label: str, key: str, current: str = "General") -> str:
     """
@@ -1048,6 +1060,49 @@ else:
 )
 
 URGENCY_BADGE = {"stat": "🔴 STAT", "urgent": "🟠 Urgent", "routine": "⚪ Routine"}
+
+
+def word_diff_html(before: str, after: str) -> str:
+    """
+    A word-level visual diff, safe HTML. Green = added, red struck = removed,
+    plain = unchanged. A VIEW of two texts - it never edits either.
+    """
+    import difflib
+    import html as _html
+
+    def _tokens(text: str) -> list[str]:
+        return re.findall(r"\S+|\n", text or "")
+
+    a, b = _tokens(before), _tokens(after)
+    pieces: list[str] = []
+
+    def _render(tokens: list[str], style: str = "") -> None:
+        for token in tokens:
+            if token == "\n":
+                pieces.append("<br>")
+            elif style:
+                pieces.append(f'<span style="{style}">'
+                              f"{_html.escape(token)}</span> ")
+            else:
+                pieces.append(_html.escape(token) + " ")
+
+    for op, a0, a1, b0, b1 in difflib.SequenceMatcher(None, a, b).get_opcodes():
+        if op == "equal":
+            _render(a[a0:a1])
+        else:
+            if op in ("delete", "replace"):
+                _render(a[a0:a1],
+                        "background:#fde8e8;color:#8a1f1f;"
+                        "text-decoration:line-through;border-radius:3px;"
+                        "padding:0 2px;")
+            if op in ("insert", "replace"):
+                _render(b[b0:b1],
+                        "background:#e3f6e8;color:#14532d;"
+                        "border-radius:3px;padding:0 2px;")
+    return ('<div style="border:1px solid #D8E3E3;border-radius:8px;'
+            'padding:12px 14px;line-height:1.7;max-height:340px;'
+            'overflow-y:auto;background:#FFFFFF;">'
+            + "".join(pieces) + "</div>")
 
 
 def stale_modules_banner() -> None:
@@ -3222,6 +3277,13 @@ with tab_draft:
 
         # ------------- Split view: notes in, draft out ------------- #
 
+        # A prompt queued by the history drawer's "Reuse" button lands here,
+        # BEFORE the keyed textarea is instantiated - the only point Streamlit
+        # allows the write.
+        _queued_prompt = st.session_state.pop("draft_prompt_pending", None)
+        if _queued_prompt is not None:
+            st.session_state["draft_prompt"] = _queued_prompt
+
         in_col, out_col = st.columns(2, gap="large")
 
         with in_col:
@@ -3295,7 +3357,8 @@ with tab_draft:
             st.session_state["draft_assumptions"] = result["assumptions"]
 
         with in_col:
-            if st.button(":material/edit_note: Write in this doctor's style",
+            if st.button(":material/edit_note: Write in this doctor's style "
+                         "(Ctrl+Enter)",
                          type="primary", width="stretch",
                          disabled=not rough.strip()):
                 run_draft(rough, st.session_state.get("draft_answers", {}))
@@ -3411,14 +3474,35 @@ with tab_draft:
                             "you write**")
                 if applied_bits:
                     st.caption("Applied: " + " · ".join(applied_bits))
-                drafted = st.text_area("Edit the draft", drafted, height=340,
-                                       key="draft_edit",
-                                       label_visibility="collapsed")
+                edit_tab, diff_tab = st.tabs(
+                    [":material/edit: Edit the draft",
+                     ":material/difference: What changed"])
+                with edit_tab:
+                    drafted = st.text_area("Edit the draft", drafted, height=340,
+                                           key="draft_edit",
+                                           label_visibility="collapsed")
 
                 notes_in = st.session_state.get("draft_in", "")
 
-                # Safety badge 1: negations. The generator already hard-stops on
-                # a flipped negative; this re-checks the DOCTOR'S EDITS too.
+                with diff_tab:
+                    basis = st.radio(
+                        "Compare", ["My notes → AI draft", "AI draft → my edits"],
+                        horizontal=True, key="draft_diff_basis",
+                        label_visibility="collapsed")
+                    if basis == "My notes → AI draft":
+                        diff_a, diff_b = notes_in, st.session_state.get(
+                            "draft_original", "")
+                    else:
+                        diff_a, diff_b = st.session_state.get(
+                            "draft_original", ""), drafted
+                    st.markdown(word_diff_html(diff_a, diff_b),
+                                unsafe_allow_html=True)
+                    st.caption(
+                        "Green: added. Red struck through: removed or replaced. "
+                        "A view, never an edit."
+                    )
+
+                # ---- live safety badges: deterministic, over the CURRENT edit ----
                 import negation as negation_engine
 
                 try:
@@ -3429,47 +3513,81 @@ with tab_draft:
                         if v)
                 except Exception:
                     mismatches, omissions, negated_total = [], [], 0
+                try:
+                    import ai_parser
+
+                    dropped = ai_parser.missing_facts(notes_in, drafted)
+                    numbers_total = len(set(
+                        re.findall(r"\d+(?:\.\d+)?", notes_in)))
+                except Exception:
+                    dropped, numbers_total = [], 0
+                try:
+                    note_terms = list(negation_engine.polarity_map(notes_in))
+                    draft_lower = drafted.lower()
+                    terms_missing = [t for t in note_terms
+                                     if t not in draft_lower]
+                    terms_total = len(note_terms)
+                except Exception:
+                    terms_missing, terms_total = [], 0
+
+                badge_neg, badge_num, badge_terms = st.columns(3)
+                with badge_neg:
+                    if mismatches:
+                        st.error(f"🔴 Negations: {len(mismatches)} flipped")
+                    elif omissions:
+                        st.warning(f"🟡 Negations: {len(omissions)} unstated")
+                    elif negated_total:
+                        st.success(f"🟢 Negations {negated_total}/{negated_total}")
+                    else:
+                        st.caption("— no negations in notes")
+                with badge_num:
+                    if dropped:
+                        st.error(f"🔴 Measurements: {len(dropped)} missing")
+                    elif numbers_total:
+                        st.success(f"🟢 Measurements {numbers_total}/{numbers_total}")
+                    else:
+                        st.caption("— no numbers in notes")
+                with badge_terms:
+                    if terms_missing:
+                        st.warning(f"🟡 Findings: {len(terms_missing)} not carried")
+                    elif terms_total:
+                        st.success(f"🟢 Findings carried {terms_total}/{terms_total}")
+                    else:
+                        st.caption("— no tracked findings")
 
                 if mismatches:
                     st.error(
-                        "🔴 **Negation flipped**: "
+                        "**Negation flipped**: "
                         + ", ".join(f"“{m.entity}”" for m in mismatches)
                         + " — negated in your notes but ASSERTED in this draft. "
                         "Fix it before this text goes anywhere."
                     )
                 elif omissions:
-                    st.warning(
-                        "🟡 Negatives from your prompt not mentioned in the draft: "
+                    st.caption(
+                        "Negatives not mentioned in the draft: "
                         + ", ".join(f"“no {o}”" for o in omissions)
                         + ". Often fine in a summary — confirm it is deliberate."
                     )
-                elif negated_total:
-                    st.success(f"🟢 Negations intact ({negated_total}/{negated_total}).")
-
-                # Safety badge 2: measurements.
-                try:
-                    import ai_parser
-
-                    dropped = ai_parser.missing_facts(notes_in, drafted)
-                except Exception:
-                    dropped = []
                 if dropped:
                     st.error(
-                        "🔴 **Numbers from your prompt missing from the draft**: "
+                        "**Numbers from your prompt missing from the draft**: "
                         + ", ".join(dropped)
                         + ". Check nothing was lost or altered before using it."
                     )
-                else:
-                    st.success("🟢 Measurements preserved — every number from your "
-                               "prompt appears in the draft.")
+                if terms_missing:
                     st.caption(
-                        "The badges check polarity and numbers. Whether a finding "
-                        "was reworded correctly is your read."
-                        + (" In instructions mode the AI adds standard normal "
-                           "descriptions by design — the badges only guarantee "
-                           "that YOUR stated numbers and negations survived."
-                           if instruction_mode else "")
+                        "Findings from your notes the draft does not name: "
+                        + ", ".join(f"“{t}”" for t in terms_missing)
                     )
+                st.caption(
+                    "The badges check polarity, numbers and named findings — "
+                    "deterministically, on your CURRENT edit. Whether a finding "
+                    "was reworded correctly is your read."
+                    + (" In instructions mode the AI adds standard normal "
+                       "descriptions by design — the badges only guarantee "
+                       "that YOUR stated content survived." if instruction_mode
+                       else "")
+                )
 
                 # -------- teach -------- #
                 original = st.session_state.get("draft_original", "")
@@ -3493,7 +3611,8 @@ with tab_draft:
                         placeholder="I always write calculi, not stones, and I "
                                     "number the impression.",
                     )
-                    if st.button(":material/school: Save edits & teach style",
+                    if st.button(":material/school: Save edits & teach style "
+                                 "(Ctrl+S)",
                                  type="primary", width="stretch"):
                         import ai_parser
 
@@ -3615,6 +3734,72 @@ with tab_draft:
                                "treated verbatim and the audit applies again."):
                 st.session_state["prefill"] = drafted
                 st.success("Loaded — open **Report** and choose the format.")
+
+        # ------------- history: past prompts, one click back ------------- #
+
+        with st.expander(
+            f":material/history: Past drafts & prompts — {doctor_label}",
+            expanded=False,
+        ):
+            past = memory.load_pairs(doctor=template.name)
+            if not past:
+                st.caption(
+                    "Every time you press *Save edits & teach style* or save an "
+                    "edited draft to the doctor, the (notes, AI draft, your "
+                    "version) triple lands here — reusable, and exportable as a "
+                    "fine-tuning dataset."
+                )
+            for i, pair in enumerate(reversed(past[-10:])):
+                with st.container(border=True):
+                    head = pair.get("when", "")[:16].replace("T", " ")
+                    if pair.get("rule"):
+                        head += f" · learned: {pair['rule'][:80]}"
+                    st.caption(head or "undated")
+                    snippet = (pair.get("raw_prompt") or "").strip()
+                    st.text(snippet[:220] + ("…" if len(snippet) > 220 else ""))
+                    if st.button(":material/replay: Reuse this prompt",
+                                 key=f"hist_reuse_{i}"):
+                        st.session_state["draft_prompt_pending"] = snippet
+                        st.rerun()
+            if past:
+                st.download_button(
+                    ":material/download: Export all pairs as JSONL (DPO dataset)",
+                    data=memory.export_pairs_jsonl(doctor=template.name),
+                    file_name="preference_pairs.jsonl", mime="application/jsonl",
+                    key="hist_export",
+                )
+
+        # ------------- keyboard-first: hotkeys + autofocus ------------- #
+        # Injected into the PARENT document (Streamlit renders components in
+        # an iframe). Best effort by design: if a Streamlit upgrade changes
+        # the DOM, the shortcuts stop and the buttons keep working.
+        components.html("""<script>
+        (function () {
+          const doc = window.parent.document;
+          if (!doc.__hcHotkeys) {
+            doc.__hcHotkeys = true;
+            doc.addEventListener('keydown', function (e) {
+              const mod = e.ctrlKey || e.metaKey;
+              if (!mod) return;
+              const buttons = Array.from(doc.querySelectorAll('button'));
+              if (e.key === 'Enter') {
+                const b = buttons.find(function (x) {
+                  return x.innerText.indexOf("Write in this doctor's style") !== -1; });
+                if (b && !b.disabled) { e.preventDefault(); b.click(); }
+              } else if (e.key === 's' || e.key === 'S') {
+                const b = buttons.find(function (x) {
+                  return x.innerText.indexOf('Save edits & teach style') !== -1; });
+                if (b) { e.preventDefault(); b.click(); }
+              }
+            }, true);
+          }
+          if (!doc.__hcFocused) {
+            const area = doc.querySelector(
+              'div[role="tabpanel"]:not([hidden]) textarea');
+            if (area) { doc.__hcFocused = true; area.focus(); }
+          }
+        })();
+        </script>""", height=0)
 
 
 
