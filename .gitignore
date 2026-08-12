@@ -42,3 +42,8 @@ incoming_dicom/
 
 # Saved report records (patient data) on the file store
 templates/_reports/
+
+# Tenant template data on the file store - a clinic's learned templates,
+# vocabulary corpus and agent memory are runtime data, never repo content.
+# (Also covers _backups and _reports above; kept twice for clarity.)
+templates/*/
