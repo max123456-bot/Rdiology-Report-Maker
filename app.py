@@ -385,6 +385,15 @@ def templates_changed() -> None:
 
 all_templates = load_templates()
 template_names = list(all_templates.keys())
+
+# A profile switch queued by ANY later widget (create-profile buttons, the
+# dialogs, the AI-template save) lands here, BEFORE the tpl_pick widget is
+# instantiated - the only point Streamlit allows the write. Setting tpl_pick
+# directly after the Report tab's selectbox has rendered raises
+# StreamlitAPIException, so nothing below this line assigns it directly.
+_tpl_pending = st.session_state.pop("tpl_pick_pending", None)
+if _tpl_pending in template_names:
+    st.session_state["tpl_pick"] = _tpl_pending
 if st.session_state.get("tpl_pick") not in template_names:
     st.session_state["tpl_pick"] = template_names[0]
 
@@ -392,6 +401,26 @@ if st.session_state.get("tpl_pick") not in template_names:
 # Reading session_state here keeps every tab on the same template in one pass.
 picked_template = st.session_state["tpl_pick"]
 template = all_templates[picked_template]
+
+# ---- per-profile draft workspaces: every doctor's chat is their own ---- #
+_DRAFT_KEYS = ("draft_prompt", "draft_in", "draft_out", "draft_original",
+               "draft_edit", "draft_questions", "draft_assumptions",
+               "draft_answers", "draft_section", "draft_note")
+_previous_profile = st.session_state.get("draft_profile")
+if _previous_profile is None:
+    st.session_state["draft_profile"] = picked_template
+elif _previous_profile != picked_template:
+    workspaces = st.session_state.setdefault("draft_workspaces", {})
+    workspaces[_previous_profile] = {
+        key: st.session_state[key] for key in _DRAFT_KEYS
+        if key in st.session_state}
+    restored = workspaces.get(picked_template, {})
+    for key in _DRAFT_KEYS:
+        if key in restored:
+            st.session_state[key] = restored[key]
+        else:
+            st.session_state.pop(key, None)
+    st.session_state["draft_profile"] = picked_template
 
 
 def template_summary(t: templates.Template) -> str:
@@ -462,7 +491,7 @@ def _dialog_new():
         else:
             templates.save(templates.copy_of(all_templates[base_name], name.strip(), doctor.strip()))
             templates_changed()
-            st.session_state["tpl_pick"] = name.strip()
+            st.session_state["tpl_pick_pending"] = name.strip()
             st.rerun()
 
 
@@ -526,7 +555,7 @@ def _dialog_edit(current: templates.Template):
         except templates.ConflictError as exc:
             st.error(str(exc))
         else:
-            st.session_state["tpl_pick"] = updated.name
+            st.session_state["tpl_pick_pending"] = updated.name
             st.rerun()
 
 
@@ -576,7 +605,7 @@ def _dialog_seed_template(report_text: str, corrections: tuple[str, str] | None 
                 fresh, created_by=storage.current_user() or doctor.strip())
             templates.save(fresh)
             templates_changed()
-            st.session_state["tpl_pick"] = fresh.name
+            st.session_state["tpl_pick_pending"] = fresh.name
             st.rerun()
 
 
@@ -594,7 +623,7 @@ def _dialog_delete(current: templates.Template):
         if st.button("Delete", type="primary", width="stretch"):
             templates.delete(current.name)
             templates_changed()
-            st.session_state["tpl_pick"] = templates.HC_FORMAT.name
+            st.session_state["tpl_pick_pending"] = templates.HC_FORMAT.name
             st.rerun()
     with no:
         if st.button("Cancel", width="stretch"):
@@ -3266,7 +3295,25 @@ with tab_draft:
                                                   doctor=profile_name)
                         templates.save(fresh)
                         templates_changed()
-                        st.session_state["tpl_pick"] = profile_name
+                        st.session_state["tpl_pick_pending"] = profile_name
+                        st.rerun()
+            existing_profiles = [n for n in template_names
+                                 if not all_templates[n].builtin]
+            if existing_profiles:
+                pick_col, use_col = st.columns([2, 1])
+                with pick_col:
+                    chosen_profile = st.selectbox(
+                        "…or continue as an existing doctor",
+                        existing_profiles, key="draft_profile_pick",
+                        format_func=lambda n: (
+                            n + (f" — {all_templates[n].doctor}"
+                                 if all_templates[n].doctor else "")),
+                    )
+                with use_col:
+                    st.write("")  # aligns the button with the selectbox
+                    if st.button(":material/login: Use this profile",
+                                 width="stretch"):
+                        st.session_state["tpl_pick_pending"] = chosen_profile
                         st.rerun()
         elif not (template.examples or template.preferences or template.corrections):
             st.info(
@@ -3321,7 +3368,11 @@ with tab_draft:
                 key="draft_prompt",
                 height=220,
                 label_visibility="collapsed",
+                disabled=template.builtin,
                 placeholder=(
+                    "Create or pick a doctor's profile above first — the draft "
+                    "needs a voice to write in."
+                    if template.builtin else
                     "USG abdomen for a 40 year old female.\n"
                     "Grade I fatty liver. Multiple gallstones 4-11 mm, no "
                     "cholecystitis.\nEverything else normal. My usual format."
@@ -3360,7 +3411,9 @@ with tab_draft:
             if st.button(":material/edit_note: Write in this doctor's style "
                          "(Ctrl+Enter)",
                          type="primary", width="stretch",
-                         disabled=not rough.strip()):
+                         disabled=template.builtin or not rough.strip(),
+                         help="Create or pick a doctor's profile first."
+                         if template.builtin else None):
                 run_draft(rough, st.session_state.get("draft_answers", {}))
                 st.rerun()
 
@@ -3890,7 +3943,7 @@ with tab_templates:
                         templates.save(fresh)
                         templates_changed()
                         st.session_state.pop("ait_result", None)
-                        st.session_state["tpl_pick"] = fresh.name
+                        st.session_state["tpl_pick_pending"] = fresh.name
                         st.success(
                             f"Saved. Pick **{fresh.name}** anywhere, and type "
                             f"`{trigger_preview}` in a report box to expand the "
