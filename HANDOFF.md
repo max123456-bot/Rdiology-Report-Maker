@@ -41,10 +41,10 @@ streamlit run app.py
 ```
 
 ```bash
-python selftest.py && python edge_check.py && python integration_check.py && python security_check.py && python storage_check.py && python clinical_check.py && python interop_check.py && python pacs_check.py && python master_check.py && python enterprise_check.py && python parsing_check.py && python stt_check.py && python batch_check.py
+python selftest.py && python edge_check.py && python integration_check.py && python security_check.py && python storage_check.py && python clinical_check.py && python interop_check.py && python pacs_check.py && python master_check.py && python enterprise_check.py && python parsing_check.py && python stt_check.py && python batch_check.py && python corpus_check.py
 ```
 
-All thirteen pass. All offline — no key, no network (pacs/enterprise/stt checks use only loopback).
+All fourteen pass. All offline — no key, no network (pacs/enterprise/stt/corpus checks use only loopback).
 
 The processing engine is also a service:  `uvicorn api:app` exposes parse /
 validate / triage / guidelines / impression / audit / hl7 / fhir over REST
@@ -65,6 +65,7 @@ for RIS integration, without touching the Streamlit UI.
 | `speech.py` | AI4Bharat Indic speech recognition, hosted or local. |
 | `stt.py` | Pluggable fast STT: Sarvam Saarika (Indian, code-mixed, ~1s), ElevenLabs Scribe, and ANY OpenAI-compatible endpoint (Groq Whisper, local faster-whisper) via `CUSTOM_STT_URL`. Appears in the Dictate tab when its key is set; every result shows measured latency; same ITN/lexicon/layout pipeline downstream. |
 | `batch.py` | Bulk engine behind the Batch tab: CSV/XLSX intake (metadata columns become report headings), per-report doctor auto-routing by signature (ambiguity falls back, never guesses), per-row error containment, pre-download QC dashboard, and a SHA-256 `batch_audit_manifest.csv` inside every ZIP. |
+| `corpus.py` | The clinic library: offline term extraction from uploaded books/papers (PDF/DOCX/TXT), a shared per-tenant corpus (capped 50k terms) stored under the reserved `__clinic_corpus__` name, a sound-key-bucketed TermIndex for near-miss suggestions at book scale, and top-K relevance selection feeding STT biasing + AI prompts. Suggest-only, like everything else. |
 | `triage.py` | Deterministic stat/urgent/routine from the clinical text. Negation- and history-aware. Powers the worklist order and alerts. |
 | `guidelines.py` | Fleischner 2017 sized from the actual measurement; BI-RADS/TI-RADS/PI-RADS/LI-RADS/O-RADS/Bosniak triggers. Insert is always a click, never automatic. |
 | `impression.py` | Rule-based auto-impression: only verbatim sentences from the findings. AI path in `ai_parser.draft_impression`. |

@@ -82,7 +82,10 @@ def _sarvam_config() -> dict | None:
             "url": _secret("SARVAM_STT_URL", "https://api.sarvam.ai/speech-to-text")}
 
 
-def _transcribe_sarvam(audio: bytes, mime: str, language: str) -> SttResult:
+def _transcribe_sarvam(audio: bytes, mime: str, language: str,
+                       vocab_hint: str = "") -> SttResult:
+    # Saarika has no documented keyword-biasing field today; the hint is
+    # accepted so every provider shares one signature, and ignored honestly.
     import requests
 
     config = _sarvam_config()
@@ -132,7 +135,10 @@ def _elevenlabs_config() -> dict | None:
                            "https://api.elevenlabs.io/v1/speech-to-text")}
 
 
-def _transcribe_elevenlabs(audio: bytes, mime: str, language: str) -> SttResult:
+def _transcribe_elevenlabs(audio: bytes, mime: str, language: str,
+                           vocab_hint: str = "") -> SttResult:
+    # Scribe has no documented keyword-biasing field today; accepted and
+    # ignored, same signature as the other providers.
     import requests
 
     config = _elevenlabs_config()
@@ -184,7 +190,8 @@ def _custom_config() -> dict | None:
     }
 
 
-def _transcribe_custom(audio: bytes, mime: str, language: str) -> SttResult:
+def _transcribe_custom(audio: bytes, mime: str, language: str,
+                       vocab_hint: str = "") -> SttResult:
     import requests
 
     config = _custom_config()
@@ -197,6 +204,10 @@ def _transcribe_custom(audio: bytes, mime: str, language: str) -> SttResult:
     data = {"model": config["model"], "response_format": "json"}
     if language:
         data["language"] = language
+    if vocab_hint:
+        # Whisper's initial_prompt: the clinic's terms bias recognition toward
+        # the spellings the doctors actually use. Sent only when non-empty.
+        data["prompt"] = vocab_hint
 
     started = time.perf_counter()
     try:
@@ -251,10 +262,10 @@ def available() -> dict[str, str]:
 
 
 def transcribe(provider: str, audio: bytes, mime: str,
-               language: str = "") -> SttResult:
+               language: str = "", vocab_hint: str = "") -> SttResult:
     """One recording through the chosen provider. Raises SttError, plainly."""
     entry = _BUILTINS.get(provider)
     if entry is None:
         raise SttError(f"Unknown STT provider “{provider}”. "
                        f"Configured: {', '.join(available()) or 'none'}.")
-    return entry[1](audio, mime, language)
+    return entry[1](audio, mime, language, vocab_hint)

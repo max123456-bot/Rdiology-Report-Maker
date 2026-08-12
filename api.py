@@ -205,6 +205,7 @@ async def anatomy_tree(body: ReportIn) -> dict:
 class DictationIn(BaseModel):
     text: str = Field(min_length=1)
     vocabulary: list[str] = Field(default_factory=list)
+    use_corpus: bool = False
 
 
 @app.post("/dictation-cleanup")
@@ -212,11 +213,20 @@ async def dictation_cleanup(body: DictationIn) -> dict:
     """
     Deterministic post-ASR cleanup: spoken numbers to figures, units
     normalised, medical notation joined. Suggestions are advisory only -
-    the same never-auto-apply rule as the UI.
+    the same never-auto-apply rule as the UI. With use_corpus, the clinic
+    library (corpus.py) adds its own suggestions - still advisory.
     """
     import dictation_fix
 
     result = dictation_fix.clean(body.text, body.vocabulary)
+    suggestions = list(result.suggestions or [])
+    if body.use_corpus:
+        import corpus
+        import storage
+
+        index = corpus.get_index(storage.current_tenant())
+        already = {s.heard for s in suggestions}
+        suggestions.extend(corpus.suggest(result.text, index, exclude=already))
     return {
         "text": result.text,
         "changed": result.changed,
@@ -224,7 +234,7 @@ async def dictation_cleanup(body: DictationIn) -> dict:
         "suggestions": [
             {"heard": s.heard, "suggested": s.suggested,
              "confidence": s.confidence, "reason": s.reason}
-            for s in (result.suggestions or [])
+            for s in suggestions
         ],
     }
 

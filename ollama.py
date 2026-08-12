@@ -96,12 +96,14 @@ def generate(prompt: str, *, system: str = "", model: str = "",
 
 
 def draft_impression(findings_text: str, api_key: str, model: str,
-                     template=None) -> list[str]:
+                     template=None,
+                     corpus_terms: list[str] | None = None) -> list[str]:
     """Same prompt, same JSON contract, same negation tripwire as Gemini."""
     import ai_parser
     import negation
 
-    raw = generate(ai_parser.build_impression_prompt(findings_text, template),
+    raw = generate(ai_parser.build_impression_prompt(findings_text, template,
+                                                     corpus_terms),
                    model=model, json_mode=True)
     data = json.loads(raw)
     points = [str(p).strip().rstrip(".")
@@ -115,13 +117,15 @@ def draft_impression(findings_text: str, api_key: str, model: str,
 def draft_with_questions(raw_notes: str, template, api_key: str, model: str,
                          *, section: str = "the whole report",
                          answers: dict | None = None,
-                         temperature: float = 0.2) -> dict:
+                         temperature: float = 0.2,
+                         corpus_terms: list[str] | None = None) -> dict:
     """House-style drafting on the local model, negation-checked."""
     import ai_parser
     import negation
 
     raw = generate(
-        ai_parser.build_draft_prompt(template, raw_notes, section, answers),
+        ai_parser.build_draft_prompt(template, raw_notes, section, answers,
+                                     corpus_terms),
         system=ai_parser.DRAFT_PROMPT + "\n\n" + ai_parser.ASK_PROMPT,
         model=model,
         json_mode=True,

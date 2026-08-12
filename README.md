@@ -458,6 +458,7 @@ verify.py      the word-loss audit
 ai_parser.py   optional Gemini: layout classifier, OCR, dictation transcription and layout, few-shot house-style drafting, measurement guard, model listing
 speech.py      speech-to-text backends: AI4Bharat via Hugging Face (hosted or local), audio conversion
 readers.py     txt / docx / pdf input readers
+corpus.py      the clinic library: offline term extraction from uploaded books/papers into a shared vocabulary corpus that biases STT and AI prompts (suggest-only)
 selftest.py           offline: asserts every HC FORMAT rule on the real .docx XML, plus every feature in isolation
 integration_check.py  offline: the journeys a clinic actually takes, end to end, and the handoffs between features
 security_check.py     offline: adversarial input — traversal, collisions, corrupt files, injected model IDs, prompt injection, DoS, leaked secrets

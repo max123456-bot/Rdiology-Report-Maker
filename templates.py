@@ -383,6 +383,10 @@ def save(template: Template, *, expect: str | None = None,
     Pass `expect` (a fingerprint taken when the form was drawn) to refuse the
     write if someone else changed the same template in the meantime.
     """
+    if template.name.strip() == "__clinic_corpus__":
+        # corpus.py stores the clinic library under this name in the same
+        # store; a template wearing it would shadow the library.
+        raise ValueError("That name is reserved for the clinic library.")
     storage.get_store().save(
         tenant or storage.current_tenant(), template.name, to_dict(template), expect=expect
     )
@@ -414,6 +418,10 @@ def load_all(tenant: str | None = None) -> dict[str, Template]:
     scope = tenant or storage.current_tenant()
     for name, payload in storage.get_store().load_all(scope).items():
         if name == HC_FORMAT.name:
+            continue
+        if name == "__clinic_corpus__":
+            # The clinic library (corpus.py) rides the same store under this
+            # reserved name; it is not a template. Exact match on purpose.
             continue
         try:
             out[name] = from_dict(payload)

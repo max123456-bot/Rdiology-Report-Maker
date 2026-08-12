@@ -80,6 +80,7 @@ def build_draft_prompt(
     raw_notes: str,
     section: str = "the whole report",
     answers: dict[str, str] | None = None,
+    corpus_terms: list[str] | None = None,
 ) -> str:
     """
     Assemble the few-shot prompt. Pure text, no network - so it can be tested.
@@ -105,6 +106,15 @@ def build_draft_prompt(
 
     if (template.style_notes or "").strip():
         parts.append(f"\nHouse-style notes from {doctor}:\n{template.style_notes.strip()}")
+
+    library = [t.strip() for t in (corpus_terms or []) if t.strip()]
+    if library:
+        parts.append(
+            "\nTerms from this clinic's reference library relevant to these notes. "
+            "They guide SPELLING only - prefer these exact spellings, never use "
+            "them to invent a finding that is not in the notes:\n"
+            + ", ".join(library)
+        )
 
     corrections = [
         c for c in (getattr(template, "corrections", None) or [])
@@ -253,6 +263,7 @@ def draft_with_questions(
     section: str = "the whole report",
     answers: dict[str, str] | None = None,
     temperature: float = 0.2,
+    corpus_terms: list[str] | None = None,
 ) -> dict:
     """Draft, and come back with clarifying questions where the notes are ambiguous."""
     import json as _json
@@ -262,7 +273,7 @@ def draft_with_questions(
     client = _client(api_key)
     response = _generate(client,
         model=model,
-        contents=[build_draft_prompt(template, raw_notes, section, answers)],
+        contents=[build_draft_prompt(template, raw_notes, section, answers, corpus_terms)],
         config=types.GenerateContentConfig(
             system_instruction=DRAFT_PROMPT + "\n\n" + ASK_PROMPT,
             response_mime_type="application/json",
@@ -433,7 +444,8 @@ Return JSON only:
 }"""
 
 
-def build_transcribe_prompt(template, context: str = "") -> str:
+def build_transcribe_prompt(template, context: str = "",
+                            corpus_terms: list[str] | None = None) -> str:
     """
     Prime the transcriber with this doctor's vocabulary. Pure text, no network.
 
@@ -448,6 +460,14 @@ def build_transcribe_prompt(template, context: str = "") -> str:
         parts.append(
             "Terms this radiologist actually uses. Prefer these spellings when what you hear "
             "is close to one of them:\n" + ", ".join(vocabulary)
+        )
+
+    library = [t.strip() for t in (corpus_terms or []) if t.strip()]
+    if library:
+        parts.append(
+            "Terms from this clinic's reference library likely in this dictation. "
+            "Prefer these exact spellings when the audio is close:\n"
+            + ", ".join(library)
         )
 
     fixes = [
@@ -489,6 +509,7 @@ def transcribe_dictation(
     model: str,
     *,
     context: str = "",
+    corpus_terms: list[str] | None = None,
 ) -> dict:
     """Transcribe a dictation, flagging every bit it could not hear cleanly."""
     import json as _json
@@ -500,7 +521,7 @@ def transcribe_dictation(
         model=model,
         contents=[
             types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
-            build_transcribe_prompt(template, context),
+            build_transcribe_prompt(template, context, corpus_terms),
         ],
         config=types.GenerateContentConfig(
             system_instruction=TRANSCRIBE_PROMPT,
@@ -576,6 +597,7 @@ def structure_dictation(
     *,
     context: str = "",
     language: str = "",
+    corpus_terms: list[str] | None = None,
 ) -> dict:
     """
     Lay out bare ASR text as a report.
@@ -588,7 +610,7 @@ def structure_dictation(
 
     from google.genai import types
 
-    body = [build_transcribe_prompt(template, context)]
+    body = [build_transcribe_prompt(template, context, corpus_terms)]
     if language:
         body.append(f"The doctor was speaking: {language}. Keep the report in that language.")
     body.append(f"--- RAW SPEECH RECOGNISER OUTPUT ---\n{raw_text.strip()}")
@@ -899,7 +921,8 @@ def extract_text_from_file(
     return (response.text or "").strip()
 
 
-def build_impression_prompt(findings_text: str, template=None) -> str:
+def build_impression_prompt(findings_text: str, template=None,
+                            corpus_terms: list[str] | None = None) -> str:
     """
     The auto-impression prompt. Pure text, no network - testable offline.
 
@@ -927,6 +950,13 @@ def build_impression_prompt(findings_text: str, template=None) -> str:
         notes = (getattr(template, "style_notes", "") or "").strip()
         if notes:
             parts.append(f"\nHouse-style notes:\n{notes}")
+    library = [t.strip() for t in (corpus_terms or []) if t.strip()]
+    if library:
+        parts.append(
+            "\nClinic reference-library terms relevant to these findings - "
+            "spelling guidance only, never a reason to add a finding:\n"
+            + ", ".join(library)
+        )
     parts.append(
         "\nReturn JSON only:\n"
         '{"impression": ["first point", "second point"]}'
@@ -936,7 +966,8 @@ def build_impression_prompt(findings_text: str, template=None) -> str:
 
 
 def draft_impression(
-    findings_text: str, api_key: str, model: str, template=None
+    findings_text: str, api_key: str, model: str, template=None,
+    corpus_terms: list[str] | None = None,
 ) -> list[str]:
     """
     Ask the model for impression bullets from the findings. Raises on failure;
@@ -950,7 +981,7 @@ def draft_impression(
     client = _client(api_key)
     response = _generate(client,
         model=model,
-        contents=[build_impression_prompt(findings_text, template)],
+        contents=[build_impression_prompt(findings_text, template, corpus_terms)],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             temperature=0.0,

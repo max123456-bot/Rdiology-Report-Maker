@@ -23,6 +23,7 @@ import streamlit.components.v1 as components
 
 import access
 import anatomy
+import corpus
 import crypto
 import deid
 import dicom_meta
@@ -1309,17 +1310,27 @@ with tab_single:
                                                 template.vocabulary).suggestions or [])
                 if s.reason in ("spelling", "sound", "anchor") and s.confidence >= 0.8
             ]
+            try:
+                _lib_index = corpus.get_index()
+                spell.extend(
+                    s for s in corpus.suggest(raw_text, _lib_index,
+                                              exclude={x.heard for x in spell})
+                    if s.confidence >= 0.8
+                )
+            except Exception:
+                pass  # the library is optional; pasted-text checks are not
             if spell:
                 with st.expander(
                     f":material/spellcheck: Possible misspelt terms ({len(spell)})"
                 ):
                     for s in spell:
+                        why = "clinic library" if s.reason == "corpus" else f"{s.reason} match"
                         st.markdown(f"“{s.heard}” → **{s.suggested}** "
-                                    f"· {s.reason} match, {int(s.confidence * 100)}%")
+                                    f"· {why}, {int(s.confidence * 100)}%")
                     st.caption(
-                        "Suggestions from the doctor's vocabulary and the built-in "
-                        "radiology lexicon. Nothing is changed automatically - edit "
-                        "the line above if a suggestion is right."
+                        "Suggestions from the doctor's vocabulary, the built-in "
+                        "radiology lexicon and the clinic library. Nothing is changed "
+                        "automatically - edit the line above if a suggestion is right."
                     )
 
             st.divider()
@@ -1440,7 +1451,9 @@ with tab_single:
                             provider = providers.active()
                             with st.spinner("Drafting the impression..."):
                                 st.session_state[ai_imp_key] = provider.impression(
-                                    findings_only, api_key, model_choice, template
+                                    findings_only, api_key, model_choice, template,
+                                    corpus_terms=corpus.relevant_terms(
+                                        findings_only, corpus.get_index()),
                                 )
                         except Exception as exc:
                             st.error(f"AI impression failed: {exc}")
@@ -2765,6 +2778,8 @@ with tab_dictate:
                             heard_fast = stt.transcribe(
                                 provider_id, raw_audio, mime,
                                 language=st.session_state.get("dict_stt_lang", "").strip(),
+                                vocab_hint=corpus.stt_hint(
+                                    study, template.vocabulary, corpus.get_index()),
                             )
                         st.session_state["dict_asr_text"] = heard_fast.text
                         st.caption(heard_fast.note)
@@ -2775,6 +2790,8 @@ with tab_dictate:
                                     heard_fast.text, template, api_key, model_choice,
                                     context=study,
                                     language=heard_fast.language,
+                                    corpus_terms=corpus.relevant_terms(
+                                        heard_fast.text, corpus.get_index()),
                                 )
                         else:
                             result = {
@@ -2788,7 +2805,8 @@ with tab_dictate:
                     elif engine_key == "gemini":
                         with st.spinner("Transcribing what you said..."):
                             result = ai_parser.transcribe_dictation(
-                                raw_audio, mime, template, api_key, model_choice, context=study
+                                raw_audio, mime, template, api_key, model_choice, context=study,
+                                corpus_terms=corpus.relevant_terms(study, corpus.get_index()),
                             )
                     else:
                         with st.spinner(f"Listening with AI4Bharat ({ai4b_model})..."):
@@ -2809,6 +2827,8 @@ with tab_dictate:
                                     heard.text, template, api_key, model_choice,
                                     context=study,
                                     language=speech.LANGUAGES.get(ai4b_language, ""),
+                                    corpus_terms=corpus.relevant_terms(
+                                        heard.text, corpus.get_index()),
                                 )
                         else:
                             # Raw ASR only: no layout pass, so nothing is flagged either.
@@ -2829,6 +2849,15 @@ with tab_dictate:
                          "confidence": x.confidence, "why": f"{x.reason} match"}
                         for x in (cleaned.suggestions or [])
                     ]
+                    # The clinic library gets its own pass - same rules, same
+                    # suggest-only ethos, just a much bigger shelf of terms.
+                    for x in corpus.suggest(
+                        cleaned.text, corpus.get_index(),
+                        exclude={s["heard"] for s in suggestions},
+                    ):
+                        suggestions.append(
+                            {"heard": x.heard, "suggested": x.suggested,
+                             "confidence": x.confidence, "why": "clinic library"})
                     # Rules catch split words and near-miss spellings. Meaning
                     # catches the rest - "colic list" for "cholelithiasis" is
                     # too far away for any letter or sound comparison.
@@ -3222,6 +3251,7 @@ with tab_draft:
                     result = ai_parser.draft_with_questions(
                         notes, template, api_key, model_choice,
                         section=section, answers=answers,
+                        corpus_terms=corpus.relevant_terms(notes, corpus.get_index()),
                     )
                 except Exception as exc:
                     st.error(f"Drafting failed: {exc}")
@@ -3711,6 +3741,167 @@ with tab_templates:
                 except Exception as exc:
                     st.session_state["mgr_imported"] = digest
                     st.error(f"Could not import: {exc}")
+
+    # ---------------- Clinic library (shared vocabulary corpus) ------------- #
+    _library = corpus.load()
+    with st.expander(
+        f":material/local_library: Clinic library — shared medical vocabulary "
+        f"({len(_library.terms)} terms from {len(_library.sources)} sources)",
+        expanded=False,
+    ):
+        st.caption(
+            "Upload the clinic's books and papers once; their terms are "
+            "extracted **offline** into one shared reference library. It powers "
+            "spelling suggestions, STT keyword biasing and AI prompts for every "
+            "doctor — and never rewrites anything by itself."
+        )
+
+        lib_files = st.file_uploader(
+            "Book chapter or paper (.pdf, .docx, .txt)",
+            type=["pdf", "docx", "txt"], accept_multiple_files=True,
+            key="lib_upload",
+        )
+        for lib_file in lib_files or []:
+            import hashlib as _hashlib
+
+            digest = _hashlib.sha1(lib_file.getvalue()).hexdigest()
+            state_key = f"lib_extracted_{digest}"
+            if lib_file.name in _library.sources and \
+                    _library.sources[lib_file.name].get("sha1") == digest:
+                st.caption(f"**{lib_file.name}** is already in the library.")
+                continue
+            if state_key not in st.session_state:
+                try:
+                    text = readers.read_any(lib_file.name, lib_file.getvalue())
+                except readers.NeedsOCR:
+                    st.warning(
+                        f"**{lib_file.name}** is a scanned document with no text "
+                        "layer. The offline extractor cannot read it — OCR it "
+                        "first (the Report tab's AI path can, with a key)."
+                    )
+                    continue
+                except readers.UnreadableFile as exc:
+                    st.error(f"**{lib_file.name}**: {exc}")
+                    continue
+                known = {t.lower() for t in dictation_fix.RADLEX_CORE}
+                known |= set(_library.terms)
+                for _tpl in all_templates.values():
+                    known |= {v.lower() for v in (_tpl.vocabulary or [])}
+                st.session_state[state_key] = corpus.extract_terms(
+                    text, source=lib_file.name, known=known)
+            candidates = st.session_state[state_key]
+            if not candidates:
+                st.caption(f"**{lib_file.name}**: nothing new — every term is "
+                           "already known or too common.")
+                continue
+
+            st.markdown(f"**{lib_file.name}** — {len(candidates)} candidate "
+                        "term(s). Untick anything that is not a term worth "
+                        "keeping; nothing is saved until you click Add.")
+            picked: list = []
+            grid = st.columns(3)
+            for i, cand in enumerate(candidates[:600]):
+                with grid[i % 3]:
+                    if st.checkbox(
+                        f"{cand.term} · {cand.count}×",
+                        value=True, key=f"lib_t_{digest}_{i}",
+                        help=corpus.looks_medical(cand.term.split()[0])
+                        or "phrase from this document",
+                    ):
+                        picked.append(cand)
+            if st.button(
+                f":material/library_add: Add {len(picked)} term(s) from "
+                f"{lib_file.name}", key=f"lib_add_{digest}",
+                disabled=not picked,
+            ):
+                fresh = corpus.load()
+                fresh = corpus.add_source(
+                    fresh, lib_file.name, picked,
+                    added_by=storage.current_user(), sha1=digest)
+                corpus.save(fresh)
+                st.session_state.pop(state_key, None)
+                st.success(f"Added. The library now holds "
+                           f"{len(fresh.terms)} term(s).")
+                st.rerun()
+
+        if _library.sources:
+            st.markdown("**Sources in the library**")
+            for src_name, meta in sorted(_library.sources.items()):
+                src_c1, src_c2 = st.columns([4, 1])
+                with src_c1:
+                    st.caption(
+                        f"**{src_name}** · {meta.get('terms', 0)} term(s)"
+                        + (f" · added {meta['added_at'][:10]}"
+                           if meta.get("added_at") else "")
+                        + (f" by {meta['added_by']}" if meta.get("added_by") else "")
+                    )
+                with src_c2:
+                    if st.button(":material/delete: Remove",
+                                 key=f"lib_del_{src_name}", width="stretch"):
+                        fresh = corpus.load()
+                        fresh = corpus.remove_source(fresh, src_name)
+                        corpus.save(fresh)
+                        st.rerun()
+
+            lib_a, lib_b = st.columns(2)
+            with lib_a:
+                import json as _json
+
+                st.download_button(
+                    ":material/download: Export library",
+                    data=_json.dumps(corpus.to_dict(_library), indent=2,
+                                     ensure_ascii=False),
+                    file_name="clinic_library.json", mime="application/json",
+                    key="lib_export", width="stretch",
+                )
+            with lib_b:
+                lib_import = st.file_uploader("Import a library file",
+                                              type=["json"], key="lib_import")
+                if lib_import is not None:
+                    import hashlib as _hashlib
+                    import json as _json
+
+                    imp_digest = _hashlib.sha1(lib_import.getvalue()).hexdigest()
+                    if st.session_state.get("lib_imported") != imp_digest:
+                        try:
+                            incoming = corpus.from_dict(
+                                _json.loads(lib_import.getvalue().decode("utf-8")))
+                            fresh = corpus.merge(corpus.load(), incoming)
+                            corpus.save(fresh)
+                            st.session_state["lib_imported"] = imp_digest
+                            st.success(f"Merged: {len(fresh.terms)} term(s) now.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.session_state["lib_imported"] = imp_digest
+                            st.error(f"Could not import: {exc}")
+
+            # Promote: the shelf feeds the doctor's always-sent hot list.
+            st.markdown(f"**Teach {picked_template} from the library**")
+            promo_search = st.text_input(
+                "Find terms", key="lib_promo_search",
+                placeholder="chole…",
+                label_visibility="collapsed")
+            matches = sorted(
+                (t.term for t in _library.terms.values()
+                 if promo_search.lower() in t.term.lower()),
+                key=str.lower)[:50] if promo_search.strip() else []
+            promo_pick = st.multiselect(
+                "Terms to add to this doctor's vocabulary", matches,
+                key="lib_promo_pick")
+            if st.button(":material/school: Add to this doctor's vocabulary",
+                         key="lib_promote", disabled=not promo_pick):
+                if template.builtin:
+                    st.warning("HC FORMAT (default) is read-only — pick a "
+                               "doctor's template in the sidebar first.")
+                else:
+                    templates.remember_vocabulary(template, promo_pick)
+                    templates.save(template)
+                    templates_changed()
+                    st.success(
+                        f"{len(promo_pick)} term(s) added. The hot list keeps "
+                        "the 300 most recent terms; the library keeps everything."
+                    )
+                    st.rerun()
 
     editing_name = st.selectbox(
         "Edit template", template_names, index=template_names.index(picked_template),
